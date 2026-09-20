@@ -18,9 +18,15 @@
     "openai",
     "openai-compatible",
     "api-proxy",
+    "ai-proxy",
     "chat-completions",
     "sse",
-    "express"
+    "streaming",
+    "express",
+    "nodejs",
+    "llm",
+    "self-hosted",
+    "docker"
   ],
   "files": [
     "server.js",
