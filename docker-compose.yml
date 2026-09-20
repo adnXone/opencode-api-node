@@ -1,0 +1,8 @@
+services:
+  opencode-api-node:
+    build: .
+    ports:
+      - "${PORT:-80}:80"
+    environment:
+      - API_KEY=${API_KEY:-} # 不设置API_KEY则免鉴权 如果设置按照这个格式填写：API_KEY=sk-mykey
+      - PORT=80

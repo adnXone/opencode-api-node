@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# local env files (`.env.example` stays tracked as a template)
+.env
+.env.local
+.env.*.local
+
+# logs
+npm-debug.log*
+*.log
+logs/
+
+# test / coverage
+coverage/
+.nyc_output/
+
+# build output
+dist/
+build/
+
+# pid files
+.pids-*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+*.swp

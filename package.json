@@ -1,0 +1,40 @@
+{
+  "name": "opencode-api-node",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible API proxy for opencode serve",
+  "main": "server.js",
+  "license": "MIT",
+  "author": "Adrian Marian Paunescu <adrian@adnxone.eu> (https://adnxone.eu)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adnxone/opencode-api-node.git"
+  },
+  "homepage": "https://github.com/adnxone/opencode-api-node#readme",
+  "bugs": {
+    "url": "https://github.com/adnxone/opencode-api-node/issues"
+  },
+  "keywords": [
+    "opencode",
+    "openai",
+    "openai-compatible",
+    "api-proxy",
+    "chat-completions",
+    "sse",
+    "express"
+  ],
+  "files": [
+    "server.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
