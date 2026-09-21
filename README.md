@@ -12,26 +12,54 @@ Built with Node.js and Express. Drop-in replacement for any OpenAI client.
 ## Features
 
 - **OpenAI-compatible** — drop-in replacement for any OpenAI client
-- **Free models** — only lists opencode free models (`deepseek-v4-flash-free`, `qwen3.6-plus-free`, etc.)
-- **Multi-turn conversation** — preserves context via `noReply` messages
+- **Free models** — lists opencode free models (`deepseek-v4-flash-free`, `qwen3.6-plus-free`, etc.)
+- **True streaming** — forwards backend tokens live via `prompt_async` + the
+  backend event bus (chat & text completion), with `stream_options.include_usage`
+- **Conversation memory** — pass `session_id` to keep multi-turn context in one
+  backend session instead of replaying history on every request
 - **System prompts** — maps `system` role to opencode's system prompt
-- **Streaming** — SSE character-by-character streaming (chat & text completion)
 - **Image input** — supports `image_url` for vision-capable models
 - **Text completions** — legacy `/v1/completions` endpoint
 - **API key auth** — optional `API_KEY` env var for bearer token auth
-- **Model mapping** — bare model name → `opencode/<model>` provider
+- **Resilient** — retries on network failures, configurable timeouts, OpenAI-shaped errors
+- **Model mapping** — bare model name → `opencode/<model>` provider, or `provider/model`
+- **Session inspector** — `--session [<id>]` CLI queries backend sessions as JSON
 - **Health check** — `GET /health` and `GET /`
+
+## Install
+
+```bash
+npm install -g opencode-api-node
+
+# then run it (flags win over env vars)
+opencode-api-node --port 55890 --opencode_url http://127.0.0.1:4096 --api_key sk-mykey
+```
+
+Or without installing:
+
+```bash
+npx opencode-api-node --port 55890
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/adnxone/opencode-api-node.git
+cd opencode-api-node
+npm install
+```
 
 ## Quick Start
 
 ```bash
-npm install
-
 # point at a running `opencode serve` (default http://127.0.0.1:4096)
 PORT=55890 node server.js
 
 # or via CLI flags (flags win over env vars)
 node server.js --port 55890 --opencode_url http://127.0.0.1:4096 --api_key sk-mykey
+
+# or with the global binary (same flags)
+opencode-api-node --port 55890
 ```
 
 Query session data straight from the backend (prints JSON, no server started):
@@ -83,8 +111,8 @@ curl -X POST http://localhost:80/v1/chat/completions \
   -d '{
     "model": "deepseek-v4-flash-free",
     "messages": [
-      {"role": "system", "content": "你是一只猫娘，每句话结尾加喵"},
-      {"role": "user", "content": "你好"}
+      {"role": "system", "content": "You are a pirate. End every sentence with arr!"},
+      {"role": "user", "content": "Hello there"}
     ],
     "stream": false
   }'
@@ -106,16 +134,47 @@ curl -X POST http://localhost:80/v1/completions \
 
 ### Streaming
 
+Tokens arrive as the backend produces them (not buffered):
+
 ```bash
 curl -N -X POST http://localhost:80/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-mykey" \
   -d '{
     "model": "deepseek-v4-flash-free",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": true
+    "messages": [{"role": "user", "content": "Tell me a joke"}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
   }'
 ```
+
+### Conversation memory
+
+Without `session_id` every request gets a fresh backend session (earlier turns
+are replayed into it). Pass `session_id` to pin all turns to one backend
+session — then each request only needs the new message:
+
+```bash
+# turn 1 — the response includes a session_id
+curl -X POST http://localhost:80/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-flash-free",
+    "messages": [{"role": "user", "content": "My name is Ada"}]
+  }'
+# {"id":"chatcmpl-...","session_id":"ses_f40...","choices":[...],...}
+
+# turn 2 — same session, context kept server-side
+curl -X POST http://localhost:80/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-flash-free",
+    "session_id": "ses_f40...",
+    "messages": [{"role": "user", "content": "What is my name?"}]
+  }'
+```
+
+Unknown ids return `404 {"error": {"code": "session_not_found", ...}}`.
 
 ### Image input (vision models)
 
@@ -143,6 +202,9 @@ curl -X POST http://localhost:80/v1/chat/completions \
 | `API_KEY` | (empty) | Bearer token for auth. Omit to disable auth. |
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | Backend opencode serve URL |
 | `PORT` | `80` | Adapter listening port |
+| `OPENCODE_TIMEOUT` | `15000` | Control-plane backend timeout in ms (health, models, sessions) |
+| `OPENCODE_MESSAGE_TIMEOUT` | `300000` | Generation timeout in ms (blocking and streaming) |
+| `OPENCODE_RETRIES` | `1` | Extra attempts on network-level backend failures |
 
 CLI flags override the env vars above: `--port <n>`, `--opencode_url <url>`
 (`--opencode-url` also works), `--api_key <key>` (`--api-key` also works).
@@ -211,13 +273,22 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Behavior notes
 
-- OpenAI-compatible routes with OpenAI-style JSON shapes (including the
-  `401 {"detail": {"error": ...}}` auth-error envelope and
-  `500 {"detail": "..."}` backend-error envelope).
+- OpenAI-compatible routes with OpenAI-style JSON shapes: errors are
+  `{ "error": { "message", "type", "code", "param" } }` — `401 invalid_api_key`
+  for bad auth, `400 invalid_json` for malformed bodies, `404 session_not_found`
+  for unknown `session_id`, `502 backend_unreachable` when `opencode serve` is
+  down.
+- Streaming forwards backend `message.part.delta` events live and ends with
+  `data: [DONE]`; mid-stream failures arrive as `data: {"error": ...}`. A client
+  disconnect aborts the backend run. Pass `stream_options.include_usage` for a
+  `usage` block on the final chunk.
+- `session_id` (also accepted as `sessionId`) pins turns to one backend session;
+  without it each request gets a fresh session with the history replayed.
+  Responses echo the id back as `session_id`.
+- Backend GETs are retried on HTTP 5xx and everything is retried on
+  network-level failures (`OPENCODE_RETRIES`, backoff); `prompt_async` is never
+  retried (fire-and-forget).
 - Image URLs are fetched and inlined as `data:` URLs (30s fetch timeout); any
   message containing an image forces the vision model (`qwen3.6-plus-free`).
-- Streaming replays the full text char-by-char with a 5ms delay, ending with
-  `data: [DONE]`.
-- Malformed JSON bodies return `400 {"detail": "invalid JSON body"}` instead of
-  an HTML error page.
+- Malformed JSON bodies return `400` instead of an HTML error page.
 - Requires Node.js ≥ 18 (uses the built-in `fetch`).

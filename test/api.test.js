@@ -43,7 +43,8 @@ function readJson(req) {
 }
 
 // ---- mock opencode backend ----
-const backendCalls = { history: [], final: [] };
+const backendCalls = { history: [], final: [], async: [] };
+let flakyHits = 0;
 
 const backend = http.createServer(async (req, res) => {
   const send = (code, obj) => {
@@ -51,6 +52,31 @@ const backend = http.createServer(async (req, res) => {
     res.end(JSON.stringify(obj));
   };
   if (req.method === 'GET' && req.url === '/session/status') return send(200, {});
+  if (req.method === 'GET' && req.url === '/flaky') {
+    flakyHits += 1;
+    if (flakyHits === 1) return send(500, { error: 'boom' });
+    return send(200, { ok: true });
+  }
+  if (req.method === 'GET' && req.url === '/event') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    const frame = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+    res.write(frame({ id: 'evt-0', type: 'server.connected', properties: {} }));
+    // Simulate a real backend run for the session the adapter creates.
+    setTimeout(() => {
+      try {
+        const base = { sessionID: 'sess-mock', messageID: 'msg-9', partID: 'prt-1' };
+        res.write(frame({ id: 'evt-1', type: 'message.part.delta', properties: { ...base, field: 'text', delta: 'mock ' } }));
+        res.write(frame({ id: 'evt-2', type: 'message.part.delta', properties: { ...base, field: 'reasoning', delta: 'should be ignored' } }));
+        res.write(frame({ id: 'evt-3', type: 'message.part.delta', properties: { ...base, field: 'text', delta: 'reply' } }));
+        res.write(frame({ id: 'evt-4', type: 'session.idle', properties: { sessionID: 'sess-mock' } }));
+      } catch { /* client went away */ }
+    }, 50);
+    return; // left open; the adapter aborts it after session.idle
+  }
   if (req.method === 'GET' && req.url === '/provider') {
     return send(200, {
       all: [
@@ -69,8 +95,28 @@ const backend = http.createServer(async (req, res) => {
   const gm = req.method === 'GET' && /^\/session\/([^/]+)(\/message)?$/.exec(req.url);
   if (gm) {
     if (gm[1] === 'nope') return send(404, { error: 'not found' });
-    if (gm[2] === '/message') return send(200, [{ id: 'msg-1', text: 'hi mock' }]);
+    if (gm[2] === '/message') {
+      return send(200, [
+        { id: 'msg-1', text: 'hi mock' },
+        {
+          parts: [{ type: 'text', text: 'mock reply' }],
+          info: { tokens: { input: 3, output: 4, total: 7 } },
+        },
+      ]);
+    }
     return send(200, { id: gm[1], title: `detail of ${gm[1]}` });
+  }
+  const pa = req.method === 'POST' && /^\/session\/[^/]+\/prompt_async$/.exec(req.url);
+  if (pa) {
+    const body = await readJson(req);
+    backendCalls.async.push(body);
+    res.writeHead(204);
+    return res.end();
+  }
+  const ab = req.method === 'POST' && /^\/session\/[^/]+\/abort$/.exec(req.url);
+  if (ab) {
+    res.writeHead(200);
+    return res.end();
   }
   const m = req.method === 'POST' && /^\/session\/[^/]+\/message$/.exec(req.url);
   if (m) {
@@ -140,7 +186,8 @@ test('GET /v1/models requires auth', async () => {
   const anon = await fetch(`${base}/v1/models`);
   assert.equal(anon.status, 401);
   const body = await anon.json();
-  assert.equal(body.detail.error.code, 'invalid_api_key');
+  assert.equal(body.error.code, 'invalid_api_key');
+  assert.equal(body.error.type, 'invalid_request_error');
 
   const wrong = await fetch(`${base}/v1/models`, {
     headers: { Authorization: 'Bearer wrong' },
@@ -213,6 +260,7 @@ test('POST /v1/chat/completions maps provider/model split', async () => {
 });
 
 test('POST /v1/chat/completions (stream) yields SSE + [DONE]', async () => {
+  backendCalls.async.length = 0;
   const r = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...auth },
@@ -226,8 +274,83 @@ test('POST /v1/chat/completions (stream) yields SSE + [DONE]', async () => {
   assert.match(r.headers.get('content-type'), /text\/event-stream/);
   const raw = await r.text();
   assert.ok(raw.includes('data: [DONE]'));
+  assert.ok(raw.includes('"role":"assistant"'));
+  assert.ok(raw.includes('"session_id":"sess-mock"'));
   const contents = [...raw.matchAll(/"content":"(.*?)"/g)].map((m) => m[1]);
+  // true streaming: multiple progressive deltas, reasoning delta skipped
+  assert.ok(contents.length >= 2);
   assert.equal(contents.join(''), 'mock reply');
+  assert.ok(!raw.includes('should be ignored'));
+  // prompted via fire-and-forget prompt_async, not the blocking endpoint
+  assert.equal(backendCalls.async.length, 1);
+  assert.deepEqual(backendCalls.async[0].parts, [{ type: 'text', text: 'hi' }]);
+});
+
+test('POST /v1/chat/completions (stream) honors include_usage', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+  });
+  assert.equal(r.status, 200);
+  const raw = await r.text();
+  assert.ok(raw.includes('"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}'));
+});
+
+test('POST /v1/chat/completions reuses session_id without replay', async () => {
+  backendCalls.history.length = 0;
+  backendCalls.final.length = 0;
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      session_id: 'ses-list-1',
+      messages: [
+        { role: 'user', content: 'earlier turn' },
+        { role: 'assistant', content: 'earlier answer' },
+        { role: 'user', content: 'follow-up' },
+      ],
+    }),
+  });
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.session_id, 'ses-list-1');
+  // no history replayed — the backend session already holds the turns
+  assert.equal(backendCalls.history.length, 0);
+  assert.equal(backendCalls.final.length, 1);
+  assert.deepEqual(backendCalls.final[0].parts, [{ type: 'text', text: 'follow-up' }]);
+});
+
+test('POST /v1/chat/completions rejects unknown session_id with 404', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      session_id: 'nope',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  assert.equal(r.status, 404);
+  const body = await r.json();
+  assert.equal(body.error.code, 'session_not_found');
+});
+
+test('malformed JSON body yields 400 OpenAI error', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: '{not json',
+  });
+  assert.equal(r.status, 400);
+  const body = await r.json();
+  assert.equal(body.error.code, 'invalid_json');
 });
 
 test('POST /v1/completions (non-stream)', async () => {
@@ -253,6 +376,66 @@ test('POST /v1/completions (stream) yields SSE + [DONE]', async () => {
   const raw = await r.text();
   assert.ok(raw.includes('data: [DONE]'));
   assert.ok(raw.includes('"object":"text_completion"'));
+});
+
+test('unreachable backend yields 502 OpenAI error', async () => {
+  const deadBackend = await getFreePort(); // nothing listens here
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: `http://127.0.0.1:${deadBackend}`,
+      API_KEY,
+      OPENCODE_RETRIES: '0',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...auth },
+      body: JSON.stringify({ model: 'mock-model', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(r.status, 502);
+    const body = await r.json();
+    assert.equal(body.error.code, 'backend_unreachable');
+  } finally {
+    proc.kill();
+  }
+});
+
+test('backendFetch retries GETs on 5xx', async () => {
+  const { backendFetch } = require('../server.js');
+  flakyHits = 0;
+  const r = await backendFetch(`${mockBase}/flaky`, {}, 5000);
+  assert.equal(r.status, 200);
+  assert.equal(flakyHits, 2);
+  assert.deepEqual(await r.json(), { ok: true });
+});
+
+test('extractUsageFromMessages / extractTextFromMessages read backend messages', () => {
+  const { extractUsageFromMessages, extractTextFromMessages } = require('../server.js');
+  const messages = [
+    { parts: [{ type: 'step-start' }], info: { tokens: { input: 1, output: 1, total: 2 } } },
+    {
+      parts: [{ type: 'text', text: 'hello' }, { type: 'text', text: ' world' }],
+      info: { tokens: { input: 3, output: 4, total: 7 } },
+    },
+  ];
+  assert.deepEqual(extractUsageFromMessages(messages), {
+    prompt_tokens: 3,
+    completion_tokens: 4,
+    total_tokens: 7,
+  });
+  assert.equal(extractTextFromMessages(messages), 'hello world');
+  assert.deepEqual(extractUsageFromMessages([]), {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  });
+  assert.equal(extractTextFromMessages([{ parts: [] }]), '');
 });
 
 test('parseArgs handles --port forms and rejects bad input', () => {

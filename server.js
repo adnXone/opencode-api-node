@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 'use strict';
 
 // opencode-api-node
@@ -5,15 +6,34 @@
 // Exposes the opencode session API as standard OpenAI endpoints.
 //
 // Env:
-//   API_KEY      Bearer token for auth. Empty = no auth.        (default: "")
-//   OPENCODE_URL Backend opencode serve URL.                     (default: "http://127.0.0.1:4096")
-//   PORT         Adapter listening port.                         (default: "80")
+//   API_KEY                  Bearer token for auth. Empty = no auth.        (default: "")
+//   OPENCODE_URL             Backend opencode serve URL.                     (default: "http://127.0.0.1:4096")
+//   PORT                     Adapter listening port.                         (default: "80")
+//   OPENCODE_TIMEOUT         Control-plane backend timeout in ms.            (default: "15000")
+//   OPENCODE_MESSAGE_TIMEOUT Generation timeout in ms (blocking + stream).  (default: "300000")
+//   OPENCODE_RETRIES         Extra attempts on network-level backend
+//                            failures (timeouts, refused connections).       (default: "1")
 
 const express = require('express');
 const { randomUUID } = require('crypto');
 
 let OPENCODE_URL = process.env.OPENCODE_URL || 'http://127.0.0.1:4096';
 let API_KEY = process.env.API_KEY || '';
+
+function parsePositiveInt(raw, fallback) {
+  const n = parseInt(raw, 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function parseNonNegativeInt(raw, fallback) {
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
+let OPENCODE_TIMEOUT = parsePositiveInt(process.env.OPENCODE_TIMEOUT, 15000);
+let OPENCODE_MESSAGE_TIMEOUT = parsePositiveInt(process.env.OPENCODE_MESSAGE_TIMEOUT, 300000);
+let OPENCODE_RETRIES = parseNonNegativeInt(process.env.OPENCODE_RETRIES, 1);
 
 const MIME_MAP = {
   jpg: 'image/jpeg',
@@ -42,44 +62,122 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   }
 }
 
-async function postJson(url, body, timeoutMs) {
-  return fetchWithTimeout(
+async function postJson(url, body, timeoutMs, opts = {}) {
+  return backendFetch(
     url,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     },
-    timeoutMs
+    timeoutMs,
+    opts
   );
 }
 
-// Mirrors FastAPI's HTTPBearer(auto_error=False) + 401 detail shape.
+// Backend call with retries on network-level failures (refused connection,
+// timeout, reset). HTTP 5xx responses are retried for GETs only — POSTs may
+// already have been processed server-side, so retrying them could double
+// the side effect (use { retries: 0 } for fire-and-forget calls like
+// prompt_async).
+async function backendFetch(url, options = {}, timeoutMs, opts = {}) {
+  const method = (options && options.method ? String(options.method) : 'GET').toUpperCase();
+  const retries = opts.retries !== undefined ? opts.retries : OPENCODE_RETRIES;
+  const retryOn5xx = opts.retryOn5xx !== undefined ? opts.retryOn5xx : method === 'GET';
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) await sleep(500 * 2 ** (attempt - 1));
+    try {
+      const resp = await fetchWithTimeout(url, options, timeoutMs);
+      if (retryOn5xx && resp.status >= 500) {
+        lastErr = new Error(`opencode backend returned status ${resp.status}`);
+        try {
+          if (resp.body && typeof resp.body.cancel === 'function') await resp.body.cancel();
+        } catch { /* ignore */ }
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
+// OpenAI-shaped error envelope: { error: { message, type, code, param } }.
+function openaiError(res, status, message, type, code) {
+  return res.status(status).json({
+    error: { message, type, code: code || null, param: null },
+  });
+}
+
+// Maps backend/transport failures to OpenAI errors on /v1/* routes:
+// 404 only for an explicitly requested session_id, 502 when the backend
+// is unreachable, 500 otherwise.
+function sendBackendError(res, e, what) {
+  if (e && e.status === 404) {
+    return openaiError(res, 404, e.message, 'invalid_request_error', e.code || 'not_found');
+  }
+  const msg = (e && e.message) || String(e);
+  if (/timed out|fetch failed|ECONNREFUSED|ENOTFOUND|EPIPE|aborted|abort/i.test(msg)) {
+    return openaiError(res, 502, `opencode backend unreachable: ${msg}`, 'server_error', 'backend_unreachable');
+  }
+  return openaiError(res, 500, `${what}: ${msg}`, 'server_error', 'backend_error');
+}
+
+// Mirrors OpenAI's 401 shape (extra `param: null` for compatibility).
 function verifyAuth(req, res, next) {
   if (!API_KEY) return next();
   const header = req.headers.authorization || '';
   const m = header.match(/^Bearer\s+(.+)$/i);
   const token = m ? m[1] : null;
   if (token !== API_KEY) {
-    return res.status(401).json({
-      detail: {
-        error: {
-          message: 'Incorrect API key provided. Set your API key in the Authorization header.',
-          type: 'invalid_request_error',
-          param: null,
-          code: 'invalid_api_key',
-        },
-      },
-    });
+    return openaiError(
+      res,
+      401,
+      'Incorrect API key provided. Set your API key in the Authorization header.',
+      'invalid_request_error',
+      'invalid_api_key'
+    );
   }
   return next();
 }
 
 async function createSession() {
-  const resp = await postJson(`${OPENCODE_URL}/session`, {}, 30000);
+  const resp = await postJson(`${OPENCODE_URL}/session`, {}, OPENCODE_TIMEOUT);
   if (!resp.ok) throw new Error(`create session failed with status ${resp.status}`);
   const data = await resp.json();
   return data.id;
+}
+
+async function getSession(id) {
+  const resp = await backendFetch(
+    `${OPENCODE_URL}/session/${encodeURIComponent(id)}`,
+    {},
+    OPENCODE_TIMEOUT,
+    { retryOn5xx: true }
+  );
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`get session failed with status ${resp.status}`);
+  return resp.json();
+}
+
+// Resolves the backend session for a request. Without session_id a fresh
+// session is created (history is replayed into it); with session_id the
+// existing session is reused (its server-side history is kept, nothing is
+// replayed) so multi-turn conversations need only send the new message.
+async function resolveSession(sessionId) {
+  if (sessionId) {
+    const existing = await getSession(sessionId);
+    if (!existing) {
+      const e = new Error(`session not found: ${sessionId}`);
+      e.status = 404;
+      e.code = 'session_not_found';
+      throw e;
+    }
+    return { id: sessionId, fresh: false };
+  }
+  return { id: await createSession(), fresh: true };
 }
 
 function extractAssistantText(response) {
@@ -96,6 +194,37 @@ function extractTokens(response) {
     completion_tokens: tokens.output || 0,
     total_tokens: tokens.total || 0,
   };
+}
+
+// Backend /session/{id}/message entries are parts-containers ({ parts, info },
+// no role). The newest entry holding a text part is the assistant reply.
+function lastTextBearingMessage(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const parts = (m && m.parts) || [];
+    if (parts.some((p) => p && p.type === 'text' && typeof p.text === 'string')) return m;
+  }
+  return null;
+}
+
+function extractUsageFromMessages(messages) {
+  const m = lastTextBearingMessage(messages);
+  const tokens = ((m || {}).info || {}).tokens || {};
+  return {
+    prompt_tokens: tokens.input || tokens.total || 0,
+    completion_tokens: tokens.output || 0,
+    total_tokens: tokens.total || 0,
+  };
+}
+
+function extractTextFromMessages(messages) {
+  const m = lastTextBearingMessage(messages);
+  if (!m) return '';
+  return (m.parts || [])
+    .filter((p) => p && p.type === 'text')
+    .map((p) => p.text || '')
+    .join('');
 }
 
 function parseModel(modelStr) {
@@ -147,7 +276,7 @@ async function convertOpenaiContentToParts(content) {
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-async function runChatCompletion(messages, modelStr) {
+async function prepareChat(messages, modelStr, sessionId) {
   let systemMessage = '';
   const historyTexts = [];
   let lastUserParts = [];
@@ -178,7 +307,7 @@ async function runChatCompletion(messages, modelStr) {
     );
   if (hasImage) modelStr = VISION_MODEL;
 
-  const sessionId = await createSession();
+  const session = await resolveSession(sessionId);
 
   const modelParam = parseModel(modelStr);
   const payloadBase = {};
@@ -188,23 +317,37 @@ async function runChatCompletion(messages, modelStr) {
   async function sendNoReply(parts) {
     try {
       await postJson(
-        `${OPENCODE_URL}/session/${sessionId}/message`,
+        `${OPENCODE_URL}/session/${session.id}/message`,
         { ...payloadBase, parts, noReply: true },
-        30000
+        OPENCODE_TIMEOUT
       );
     } catch {
       // best-effort history replay; failures are ignored
     }
   }
 
-  for (const text of historyTexts) {
-    await sendNoReply(text);
+  // Fresh sessions need the conversation replayed into them; reused sessions
+  // already hold the history server-side, so only the newest message is sent.
+  if (session.fresh) {
+    for (const text of historyTexts) {
+      await sendNoReply(text);
+    }
   }
 
+  return {
+    session: session.id,
+    payloadBase,
+    lastUserParts,
+    model: modelStr || 'opencode',
+  };
+}
+
+async function runChatCompletion(messages, modelStr, sessionId) {
+  const prepared = await prepareChat(messages, modelStr, sessionId);
   const resp = await postJson(
-    `${OPENCODE_URL}/session/${sessionId}/message`,
-    { ...payloadBase, parts: lastUserParts },
-    300000
+    `${OPENCODE_URL}/session/${prepared.session}/message`,
+    { ...prepared.payloadBase, parts: prepared.lastUserParts },
+    OPENCODE_MESSAGE_TIMEOUT
   );
   if (!resp.ok) throw new Error(`opencode backend returned status ${resp.status}`);
   const result = await resp.json();
@@ -212,55 +355,265 @@ async function runChatCompletion(messages, modelStr) {
   return {
     text: extractAssistantText(result),
     tokens: extractTokens(result),
-    model: modelStr || 'opencode',
+    model: prepared.model,
+    sessionId: prepared.session,
     completionId: `chatcmpl-${randomUUID()}`,
     created: Math.floor(Date.now() / 1000),
   };
 }
 
-async function doChatCompletion(messages, modelStr, stream, res) {
-  let out;
-  try {
-    out = await runChatCompletion(messages, modelStr);
-  } catch (e) {
-    return res.status(500).json({ detail: String((e && e.message) || e) });
+// Subscribes to the backend's global SSE event bus (/event). Resolves once
+// subscribed so the caller can prompt afterwards without losing deltas.
+async function openEventStream(signal) {
+  const resp = await fetch(`${OPENCODE_URL}/event`, {
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  });
+  if (!resp.ok || !resp.body) throw new Error(`event stream failed with status ${resp.status}`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  async function* gen() {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('data:')) {
+              try {
+                yield JSON.parse(line.slice(5).trim());
+              } catch {
+                // keep-alive comment or partial frame — ignore
+              }
+            }
+          }
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* already closed */ }
+    }
   }
-  const { text, tokens, model, completionId, created } = out;
+  return gen();
+}
 
-  if (stream) {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    for (const char of text) {
-      const chunk = {
+// True token streaming: prompts via prompt_async (204 immediately) and
+// forwards the backend's message.part.delta events as OpenAI SSE chunks until
+// session.idle. Failures after headers are sent become
+// `data: {"error": ...}` followed by [DONE]. A client disconnect aborts the
+// backend run via /session/{id}/abort.
+async function streamFromBackend(opts) {
+  const { res, sessionId, promptPayload, model, completionId, created, textMode, includeUsage } = opts;
+  const timeoutMs = OPENCODE_MESSAGE_TIMEOUT;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  const write = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  const writeDone = () => res.write('data: [DONE]\n\n');
+  const writeChunk = (content, finishReason) => {
+    if (textMode) {
+      write({
+        id: completionId,
+        object: 'text_completion',
+        created,
+        model,
+        session_id: sessionId,
+        choices: [{ text: content, index: 0, finish_reason: finishReason, logprobs: null }],
+      });
+    } else {
+      write({
         id: completionId,
         object: 'chat.completion.chunk',
         created,
         model,
-        choices: [{ index: 0, delta: { content: char }, finish_reason: null }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      await sleep(5);
+        session_id: sessionId,
+        choices: [{ index: 0, delta: content, finish_reason: finishReason }],
+      });
     }
-    const final = {
+  };
+
+  let finished = false;
+  let clientGone = false;
+  let timedOut = false;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { ctrl.abort(); } catch { /* ignore */ }
+  }, timeoutMs);
+  const finish = () => {
+    finished = true;
+    clearTimeout(timer);
+    res.removeListener('close', onResClose);
+  };
+  const onResClose = () => {
+    if (finished || clientGone) return;
+    clientGone = true;
+    try { ctrl.abort(); } catch { /* ignore */ }
+    // Stop the backend run too — best effort, never blocks the response.
+    fetchWithTimeout(
+      `${OPENCODE_URL}/session/${encodeURIComponent(sessionId)}/abort`,
+      { method: 'POST' },
+      5000
+    ).catch(() => {});
+  };
+  res.on('close', onResClose);
+
+  const fail = (message, code) => {
+    if (clientGone) { finish(); return; }
+    write({ error: { message, type: 'server_error', code: code || null, param: null } });
+    writeDone();
+    try { res.end(); } catch { /* ignore */ }
+    finish();
+  };
+
+  try {
+    if (!textMode) writeChunk({ role: 'assistant' }, null);
+    const events = await openEventStream(ctrl.signal);
+    const pResp = await postJson(
+      `${OPENCODE_URL}/session/${encodeURIComponent(sessionId)}/prompt_async`,
+      promptPayload,
+      timeoutMs,
+      { retries: 0 } // fire-and-forget: never retry, the first send may have run
+    );
+    if (pResp.status === 404) {
+      const e = new Error(`session not found: ${sessionId}`);
+      e.status = 404;
+      e.code = 'session_not_found';
+      throw e;
+    }
+    if (pResp.status !== 204 && !pResp.ok) {
+      throw new Error(`opencode backend returned status ${pResp.status}`);
+    }
+    try { await pResp.arrayBuffer(); } catch { /* empty 204 body — ignore */ }
+
+    for await (const evt of events) {
+      if (clientGone) break;
+      const props = (evt && evt.properties) || {};
+      if (props.sessionID !== sessionId) continue;
+      if (
+        evt.type === 'message.part.delta' &&
+        typeof props.delta === 'string' &&
+        (props.field === 'text' || props.field === undefined)
+      ) {
+        writeChunk(textMode ? props.delta : { content: props.delta }, null);
+      } else if (evt.type === 'session.idle') {
+        break;
+      } else if (evt.type === 'session.error') {
+        const detail = props.error !== undefined ? JSON.stringify(props.error) : 'unknown backend error';
+        throw new Error(`opencode backend run failed: ${detail}`);
+      }
+    }
+    try { ctrl.abort(); } catch { /* closes the SSE socket; the generator cleans up */ }
+  } catch (e) {
+    if (clientGone) { finish(); return; }
+    if (timedOut || (e && e.name === 'AbortError')) {
+      fail(`stream timed out after ${timeoutMs}ms`, 'backend_timeout');
+      return;
+    }
+    if (e && e.status === 404) {
+      fail(e.message, e.code || 'not_found');
+      return;
+    }
+    const msg = (e && e.message) || String(e);
+    fail(
+      /fetch failed|ECONNREFUSED|ENOTFOUND|EPIPE/i.test(msg)
+        ? `opencode backend unreachable: ${msg}`
+        : msg,
+      'backend_error'
+    );
+    return;
+  }
+
+  if (clientGone) { finish(); return; }
+  // Usage accounting + text fallback (tool-only replies emit no text deltas).
+  let usage;
+  try {
+    const mResp = await backendFetch(
+      `${OPENCODE_URL}/session/${encodeURIComponent(sessionId)}/message`,
+      {},
+      OPENCODE_TIMEOUT,
+      { retryOn5xx: true }
+    );
+    if (mResp.ok) {
+      const messages = await mResp.json();
+      usage = extractUsageFromMessages(messages);
+    }
+  } catch {
+    // usage stays undefined — the stream still closes cleanly
+  }
+  const final = textMode
+    ? {
+      id: completionId,
+      object: 'text_completion',
+      created,
+      model,
+      session_id: sessionId,
+      choices: [{ text: '', index: 0, finish_reason: 'stop', logprobs: null }],
+    }
+    : {
       id: completionId,
       object: 'chat.completion.chunk',
       created,
       model,
+      session_id: sessionId,
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     };
-    res.write(`data: ${JSON.stringify(final)}\n\n`);
-    res.write('data: [DONE]\n\n');
-    return res.end();
+  if (includeUsage && usage) final.usage = usage;
+  write(final);
+  writeDone();
+  try { res.end(); } catch { /* ignore */ }
+  finish();
+}
+
+async function doChatCompletion(messages, modelStr, stream, sessionId, includeUsage, res) {
+  let prepared;
+  try {
+    prepared = await prepareChat(messages, modelStr, sessionId);
+  } catch (e) {
+    return sendBackendError(res, e, 'chat completion failed');
   }
 
+  if (stream) {
+    await streamFromBackend({
+      res,
+      sessionId: prepared.session,
+      promptPayload: { ...prepared.payloadBase, parts: prepared.lastUserParts },
+      model: prepared.model,
+      completionId: `chatcmpl-${randomUUID()}`,
+      created: Math.floor(Date.now() / 1000),
+      textMode: false,
+      includeUsage,
+    });
+    return undefined;
+  }
+
+  let result;
+  try {
+    const resp = await postJson(
+      `${OPENCODE_URL}/session/${prepared.session}/message`,
+      { ...prepared.payloadBase, parts: prepared.lastUserParts },
+      OPENCODE_MESSAGE_TIMEOUT
+    );
+    if (!resp.ok) throw new Error(`opencode backend returned status ${resp.status}`);
+    result = await resp.json();
+  } catch (e) {
+    return sendBackendError(res, e, 'chat completion failed');
+  }
+  const text = extractAssistantText(result);
+  const tokens = extractTokens(result);
+
   return res.json({
-    id: completionId,
+    id: `chatcmpl-${randomUUID()}`,
     object: 'chat.completion',
-    created,
-    model,
+    created: Math.floor(Date.now() / 1000),
+    model: prepared.model,
+    session_id: prepared.session,
     choices: [
       {
         index: 0,
@@ -316,9 +669,16 @@ app.get('/v1/models', verifyAuth, async (req, res) => {
 app.post('/v1/chat/completions', verifyAuth, async (req, res) => {
   const data = req.body || {};
   try {
-    await doChatCompletion(data.messages || [], data.model || '', !!data.stream, res);
+    await doChatCompletion(
+      data.messages || [],
+      data.model || '',
+      !!data.stream,
+      data.session_id || data.sessionId || null,
+      !!(data.stream_options && data.stream_options.include_usage),
+      res
+    );
   } catch (e) {
-    return res.status(500).json({ detail: String((e && e.message) || e) });
+    return sendBackendError(res, e, 'chat completion failed');
   }
 });
 
@@ -327,55 +687,56 @@ app.post('/v1/completions', verifyAuth, async (req, res) => {
   let prompt = data.prompt !== undefined ? data.prompt : '';
   if (Array.isArray(prompt)) prompt = prompt.join('\n');
   const stream = !!data.stream;
-  const modelStr = data.model || '';
+  const sessionId = data.session_id || data.sessionId || null;
+  const includeUsage = !!(data.stream_options && data.stream_options.include_usage);
 
-  // Reuse the chat path for the actual backend call (non-streaming),
-  // then reshape to a text_completion.
-  const messages = [{ role: 'user', content: prompt }];
-  let text;
-  let tokens;
+  let prepared;
   try {
-    const out = await runChatCompletion(messages, modelStr);
-    text = out.text;
-    tokens = out.tokens;
+    prepared = await prepareChat([{ role: 'user', content: prompt }], data.model || '', sessionId);
   } catch (e) {
-    return res.status(500).json({ detail: String((e && e.message) || e) });
+    return sendBackendError(res, e, 'text completion failed');
   }
 
   if (stream) {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    for (const char of text) {
-      const chunk = {
-        id: `cmpl-${randomUUID()}`,
-        object: 'text_completion',
+    try {
+      await streamFromBackend({
+        res,
+        sessionId: prepared.session,
+        promptPayload: { ...prepared.payloadBase, parts: prepared.lastUserParts },
+        model: prepared.model,
+        completionId: `cmpl-${randomUUID()}`,
         created: Math.floor(Date.now() / 1000),
-        model: modelStr || 'opencode',
-        choices: [{ text: char, index: 0, finish_reason: null, logprobs: null }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      await sleep(5);
+        textMode: true,
+        includeUsage,
+      });
+    } catch (e) {
+      return sendBackendError(res, e, 'text completion failed');
     }
-    const final = {
-      id: `cmpl-${randomUUID()}`,
-      object: 'text_completion',
-      created: Math.floor(Date.now() / 1000),
-      model: modelStr || 'opencode',
-      choices: [{ text: '', index: 0, finish_reason: 'stop', logprobs: null }],
-    };
-    res.write(`data: ${JSON.stringify(final)}\n\n`);
-    res.write('data: [DONE]\n\n');
-    return res.end();
+    return undefined;
+  }
+
+  let text;
+  let tokens;
+  try {
+    const resp = await postJson(
+      `${OPENCODE_URL}/session/${prepared.session}/message`,
+      { ...prepared.payloadBase, parts: prepared.lastUserParts },
+      OPENCODE_MESSAGE_TIMEOUT
+    );
+    if (!resp.ok) throw new Error(`opencode backend returned status ${resp.status}`);
+    const result = await resp.json();
+    text = extractAssistantText(result);
+    tokens = extractTokens(result);
+  } catch (e) {
+    return sendBackendError(res, e, 'text completion failed');
   }
 
   return res.json({
     id: `cmpl-${randomUUID()}`,
     object: 'text_completion',
     created: Math.floor(Date.now() / 1000),
-    model: modelStr || 'opencode',
+    model: prepared.model,
+    session_id: prepared.session,
     choices: [{ text, index: 0, finish_reason: 'stop', logprobs: null }],
     usage: tokens,
   });
@@ -384,7 +745,7 @@ app.post('/v1/completions', verifyAuth, async (req, res) => {
 // Keep body-parse errors JSON instead of Express' default HTML.
 app.use((err, req, res, next) => {
   if (err && (err.status === 400 || err.type === 'entity.parse.failed')) {
-    return res.status(400).json({ detail: 'invalid JSON body' });
+    return openaiError(res, 400, 'invalid JSON body', 'invalid_request_error', 'invalid_json');
   }
   return next(err);
 });
@@ -410,7 +771,10 @@ Options:
 Env:
   PORT                     Adapter listening port (default: 80)
   OPENCODE_URL             Backend opencode serve URL (default: http://127.0.0.1:4096)
-  API_KEY                  Bearer token for auth, empty = no auth (default: empty)`);
+  API_KEY                  Bearer token for auth, empty = no auth (default: empty)
+  OPENCODE_TIMEOUT         Control-plane backend timeout in ms (default: 15000)
+  OPENCODE_MESSAGE_TIMEOUT Generation timeout in ms, blocking and stream (default: 300000)
+  OPENCODE_RETRIES         Extra attempts on network-level backend failures (default: 1)`);
 }
 
 function parseArgs(argv) {
@@ -517,3 +881,6 @@ if (require.main === module) {
 module.exports = app;
 module.exports.parseArgs = parseArgs;
 module.exports.runSessionQuery = runSessionQuery;
+module.exports.backendFetch = backendFetch;
+module.exports.extractUsageFromMessages = extractUsageFromMessages;
+module.exports.extractTextFromMessages = extractTextFromMessages;

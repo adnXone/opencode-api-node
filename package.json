@@ -1,8 +1,11 @@
 {
   "name": "opencode-api-node",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenAI-compatible API proxy for opencode serve",
   "main": "server.js",
+  "bin": {
+    "opencode-api-node": "./server.js"
+  },
   "license": "MIT",
   "author": "Adrian Marian Paunescu <adrian@adnxone.eu> (https://adnxone.eu)",
   "repository": {
