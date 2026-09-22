@@ -17,6 +17,9 @@ Built with Node.js and Express. Drop-in replacement for any OpenAI client.
   backend event bus (chat & text completion), with `stream_options.include_usage`
 - **Conversation memory** — pass `session_id` to keep multi-turn context in one
   backend session instead of replaying history on every request
+- **Thinking output** — backend reasoning streams as `reasoning_content`
+  deltas (opt-in via `include_reasoning: true`) and non-streaming replies
+  carry `message.reasoning_content`
 - **System prompts** — maps `system` role to opencode's system prompt
 - **Image input** — supports `image_url` for vision-capable models
 - **Text completions** — legacy `/v1/completions` endpoint
@@ -216,6 +219,38 @@ reads `.env` automatically (built-in loader, no dotenv dependency);
 `docker compose` loads `.env` automatically too. Precedence: CLI flags >
 shell env > `.env` file > defaults.
 
+### Thinking / reasoning
+
+Chat completions expose backend thinking as `reasoning_content`
+(DeepSeek/OpenRouter convention):
+
+```bash
+# streaming — opt in, otherwise thinking is dropped and content stays clean
+curl -N -X POST http://localhost:80/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "deepseek-v4-flash-free",
+       "messages": [{"role": "user", "content": "Think step by step"}],
+       "stream": true, "include_reasoning": true}'
+# deltas arrive as {"reasoning_content": "..."} alongside {"content": "..."}
+
+# non-streaming — included automatically when the backend produced thinking
+curl -X POST http://localhost:80/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "deepseek-v4-flash-free",
+       "messages": [{"role": "user", "content": "Hello"}]}'
+# {"choices": [{"message": {"role": "assistant", "content": "...",
+#                           "reasoning_content": "..."}}], ...}
+```
+
+Aliases accepted: `include_thinking`, `stream_options.include_reasoning`,
+`reasoning` / `reasoning_effort`, `thinking` / `enable_thinking`
+(`reasoning: { effort: "none" }` disables thinking output). These only gate
+adapter output — effort itself is tuned via opencode model variants, and the
+aliases are never forwarded to the backend. `usage` gains
+`completion_tokens_details.reasoning_tokens` when the backend reports it.
+`/v1/completions` (legacy text endpoint) omits thinking — use chat
+completions for reasoning models.
+
 ## Tests
 
 ```bash
@@ -282,7 +317,10 @@ MIT — see [LICENSE](./LICENSE).
 - Streaming forwards backend `message.part.delta` events live and ends with
   `data: [DONE]`; mid-stream failures arrive as `data: {"error": ...}`. A client
   disconnect aborts the backend run. Pass `stream_options.include_usage` for a
-  `usage` block on the final chunk.
+  `usage` block on the final chunk. Thinking streams as
+  `delta.reasoning_content` only with `include_reasoning: true`; reasoning
+  parts are tracked via `message.part.updated` so thinking never leaks into
+  `content`.
 - `session_id` (also accepted as `sessionId`) pins turns to one backend session;
   without it each request gets a fresh session with the history replayed.
   Responses echo the id back as `session_id`.

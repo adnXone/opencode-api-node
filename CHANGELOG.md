@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-22
+
+### Added
+
+- Thinking output: backend reasoning parts are exposed OpenAI-style as
+  `reasoning_content` (DeepSeek/OpenRouter/vLLM convention)
+  - Streaming chat completions forward thinking as
+    `delta.reasoning_content` chunks when the client opts in
+    (`include_reasoning: true`; also accepts `include_thinking`,
+    `stream_options.include_reasoning`, `reasoning`,
+    `reasoning_effort`, `thinking` / `enable_thinking`). Default still
+    drops thinking so `content` stays clean.
+  - Reasoning parts are tracked via `message.part.updated` snapshots, so
+    thinking never leaks into `content` even when the backend streams it
+    with `field: "text"` on a reasoning part.
+  - Non-streaming chat completions include `message.reasoning_content`
+    whenever the backend produced thinking (unless explicitly disabled,
+    e.g. `reasoning: { effort: "none" }`).
+  - `usage.completion_tokens_details.reasoning_tokens` when the backend
+    reports reasoning tokens.
+- Thinking request aliases are accepted without error but never forwarded
+  to the backend: opencode tunes effort via model variants
+  (`opencode.json`), the adapter only gates reasoning output. Effort
+  tuning via `tools`-style per-message params is not supported by
+  `POST /session/:id/message` (`{ messageID?, model?, agent?, noReply?,
+  system?, tools?, parts }`).
+
 ## [1.1.1] - 2026-09-22
 
 ### Fixed

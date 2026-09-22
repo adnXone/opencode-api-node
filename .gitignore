@@ -30,3 +30,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# local planning notes
+v1.3.md

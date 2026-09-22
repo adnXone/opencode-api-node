@@ -68,10 +68,15 @@ const backend = http.createServer(async (req, res) => {
     // Simulate a real backend run for the session the adapter creates.
     setTimeout(() => {
       try {
-        const base = { sessionID: 'sess-mock', messageID: 'msg-9', partID: 'prt-1' };
-        res.write(frame({ id: 'evt-1', type: 'message.part.delta', properties: { ...base, field: 'text', delta: 'mock ' } }));
-        res.write(frame({ id: 'evt-2', type: 'message.part.delta', properties: { ...base, field: 'reasoning', delta: 'should be ignored' } }));
-        res.write(frame({ id: 'evt-3', type: 'message.part.delta', properties: { ...base, field: 'text', delta: 'reply' } }));
+        const textBase = { sessionID: 'sess-mock', messageID: 'msg-9', partID: 'prt-text' };
+        const reasonBase = { sessionID: 'sess-mock', messageID: 'msg-9', partID: 'prt-reason' };
+        // Authoritative snapshot marking prt-reason as a thinking part.
+        res.write(frame({ id: 'evt-r0', type: 'message.part.updated', properties: { part: { id: 'prt-reason', type: 'reasoning', sessionID: 'sess-mock' } } }));
+        res.write(frame({ id: 'evt-1', type: 'message.part.delta', properties: { ...textBase, field: 'text', delta: 'mock ' } }));
+        res.write(frame({ id: 'evt-2', type: 'message.part.delta', properties: { ...reasonBase, field: 'reasoning', delta: 'should be ignored' } }));
+        // Backend quirk shape: text field on a reasoning part — must never leak into content.
+        res.write(frame({ id: 'evt-2b', type: 'message.part.delta', properties: { ...reasonBase, field: 'text', delta: 'hidden-thought' } }));
+        res.write(frame({ id: 'evt-3', type: 'message.part.delta', properties: { ...textBase, field: 'text', delta: 'reply' } }));
         res.write(frame({ id: 'evt-4', type: 'session.idle', properties: { sessionID: 'sess-mock' } }));
       } catch { /* client went away */ }
     }, 50);
@@ -127,7 +132,10 @@ const backend = http.createServer(async (req, res) => {
     }
     backendCalls.final.push(body);
     return send(200, {
-      parts: [{ type: 'text', text: 'mock reply' }],
+      parts: [
+        { type: 'reasoning', text: 'mock thought' },
+        { type: 'text', text: 'mock reply' },
+      ],
       info: { tokens: { input: 3, output: 4, total: 7 } },
     });
   }
@@ -277,13 +285,68 @@ test('POST /v1/chat/completions (stream) yields SSE + [DONE]', async () => {
   assert.ok(raw.includes('"role":"assistant"'));
   assert.ok(raw.includes('"session_id":"sess-mock"'));
   const contents = [...raw.matchAll(/"content":"(.*?)"/g)].map((m) => m[1]);
-  // true streaming: multiple progressive deltas, reasoning delta skipped
+  // true streaming: multiple progressive deltas, thinking dropped by default
+  // (both the reasoning-field delta and the text-field delta on a reasoning part)
   assert.ok(contents.length >= 2);
   assert.equal(contents.join(''), 'mock reply');
   assert.ok(!raw.includes('should be ignored'));
+  assert.ok(!raw.includes('hidden-thought'));
+  assert.ok(!raw.includes('reasoning_content'));
   // prompted via fire-and-forget prompt_async, not the blocking endpoint
   assert.equal(backendCalls.async.length, 1);
   assert.deepEqual(backendCalls.async[0].parts, [{ type: 'text', text: 'hi' }]);
+});
+
+test('POST /v1/chat/completions (stream) forwards thinking with include_reasoning', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      include_reasoning: true,
+    }),
+  });
+  assert.equal(r.status, 200);
+  const raw = await r.text();
+  assert.ok(raw.includes('data: [DONE]'));
+  const thinking = [...raw.matchAll(/"reasoning_content":"(.*?)"/g)].map((m) => m[1]);
+  assert.equal(thinking.join(''), 'should be ignoredhidden-thought');
+  // content stays clean — thinking never leaks into it
+  const contents = [...raw.matchAll(/"content":"(.*?)"/g)].map((m) => m[1]);
+  assert.equal(contents.join(''), 'mock reply');
+});
+
+test('POST /v1/chat/completions (non-stream) includes reasoning_content', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.choices[0].message.content, 'mock reply');
+  assert.equal(body.choices[0].message.reasoning_content, 'mock thought');
+});
+
+test('POST /v1/chat/completions (non-stream) drops thinking when disabled', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'mock-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning: { effort: 'none' },
+    }),
+  });
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.choices[0].message.content, 'mock reply');
+  assert.ok(!('reasoning_content' in body.choices[0].message));
 });
 
 test('POST /v1/chat/completions (stream) honors include_usage', async () => {
@@ -436,6 +499,44 @@ test('extractUsageFromMessages / extractTextFromMessages read backend messages',
     total_tokens: 0,
   });
   assert.equal(extractTextFromMessages([{ parts: [] }]), '');
+});
+
+test('resolveReasoningPref handles thinking aliases', () => {
+  const { resolveReasoningPref } = require('../server.js');
+  assert.equal(resolveReasoningPref({}), null);
+  assert.equal(resolveReasoningPref({ include_reasoning: true }), true);
+  assert.equal(resolveReasoningPref({ include_reasoning: false }), false);
+  assert.equal(resolveReasoningPref({ stream_options: { include_reasoning: true } }), true);
+  assert.equal(resolveReasoningPref({ reasoning: { effort: 'high' } }), true);
+  assert.equal(resolveReasoningPref({ reasoning: { effort: 'none' } }), false);
+  assert.equal(resolveReasoningPref({ reasoning: { enabled: false } }), false);
+  assert.equal(resolveReasoningPref({ reasoning_effort: 'low' }), true);
+  assert.equal(resolveReasoningPref({ reasoning_effort: 'none' }), false);
+  assert.equal(resolveReasoningPref({ thinking: { type: 'enabled' } }), true);
+  assert.equal(resolveReasoningPref({ enable_thinking: false }), false);
+});
+
+test('extractReasoningText / extractTokens cover thinking', () => {
+  const { extractReasoningText, extractTokens } = require('../server.js');
+  assert.equal(extractReasoningText({ parts: [{ type: 'text', text: 'hi' }] }), '');
+  assert.equal(
+    extractReasoningText({ parts: [{ type: 'reasoning', text: 'a' }, { type: 'text', text: 'b' }, { type: 'reasoning', text: 'c' }] }),
+    'ac'
+  );
+  assert.deepEqual(extractTokens({ info: { tokens: { input: 1, output: 2, total: 3 } } }), {
+    prompt_tokens: 1,
+    completion_tokens: 2,
+    total_tokens: 3,
+  });
+  assert.deepEqual(
+    extractTokens({ info: { tokens: { input: 1, output: 5, total: 6, reasoning: 3 } } }),
+    {
+      prompt_tokens: 1,
+      completion_tokens: 5,
+      total_tokens: 6,
+      completion_tokens_details: { reasoning_tokens: 3 },
+    }
+  );
 });
 
 test('parseArgs handles --port forms and rejects bad input', () => {

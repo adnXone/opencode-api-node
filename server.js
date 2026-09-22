@@ -230,13 +230,27 @@ function extractAssistantText(response) {
   return '';
 }
 
+// Thinking/reasoning text from a single backend message ({ parts: [...] }).
+// Returns '' when the model emitted no reasoning parts.
+function extractReasoningText(response) {
+  let out = '';
+  for (const part of (response && response.parts) || []) {
+    if (part && part.type === 'reasoning' && typeof part.text === 'string') out += part.text;
+  }
+  return out;
+}
+
 function extractTokens(response) {
   const tokens = ((response || {}).info || {}).tokens || {};
-  return {
+  const usage = {
     prompt_tokens: tokens.input || tokens.total || 0,
     completion_tokens: tokens.output || 0,
     total_tokens: tokens.total || 0,
   };
+  if (Number.isInteger(tokens.reasoning)) {
+    usage.completion_tokens_details = { reasoning_tokens: tokens.reasoning };
+  }
+  return usage;
 }
 
 // Backend /session/{id}/message entries are parts-containers ({ parts, info },
@@ -254,11 +268,71 @@ function lastTextBearingMessage(messages) {
 function extractUsageFromMessages(messages) {
   const m = lastTextBearingMessage(messages);
   const tokens = ((m || {}).info || {}).tokens || {};
-  return {
+  const usage = {
     prompt_tokens: tokens.input || tokens.total || 0,
     completion_tokens: tokens.output || 0,
     total_tokens: tokens.total || 0,
   };
+  if (Number.isInteger(tokens.reasoning)) {
+    usage.completion_tokens_details = { reasoning_tokens: tokens.reasoning };
+  }
+  return usage;
+}
+
+function extractReasoningFromMessages(messages) {
+  const m = lastTextBearingMessage(messages);
+  if (!m) return '';
+  return ((m.parts || [])
+    .filter((p) => p && p.type === 'reasoning' && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join(''));
+}
+
+// Client thinking controls. Accepted aliases (all optional, never forwarded
+// to the backend — opencode tunes effort via model variants, the adapter only
+// gates reasoning output):
+//   include_reasoning / include_thinking (bool, top-level or stream_options)
+//   reasoning: false | { enabled, effort ('none' disables), exclude, include_reasoning }
+//   reasoning_effort: 'none' disables, any other string enables
+//   thinking: false | { enabled } | { type: 'enabled' }, enable_thinking (bool)
+// Returns true (explicitly on), false (explicitly off), or null (no opinion).
+function resolveReasoningPref(data) {
+  const d = data || {};
+  const boolOf = (v) => (v === true ? true : v === false ? false : null);
+  let pref = null;
+
+  const top = boolOf(d.include_reasoning ?? d.include_thinking);
+  if (top !== null) pref = top;
+  const streamOpt = d.stream_options ? boolOf(d.stream_options.include_reasoning) : null;
+  if (streamOpt !== null) pref = streamOpt;
+
+  const r = d.reasoning;
+  if (r === false) {
+    pref = false;
+  } else if (r !== undefined && r !== null) {
+    if (typeof r === 'object') {
+      if (r.enabled === false || r.exclude === true) pref = false;
+      else if (r.enabled === true || r.include_reasoning === true) pref = true;
+      if (typeof r.effort === 'string') {
+        pref = r.effort.toLowerCase() === 'none' ? false : true;
+      }
+    }
+  }
+  if (typeof d.reasoning_effort === 'string') {
+    pref = d.reasoning_effort.toLowerCase() === 'none' ? false : true;
+  }
+
+  const t = d.thinking ?? d.enable_thinking;
+  if (t === false) {
+    pref = false;
+  } else if (t === true) {
+    pref = true;
+  } else if (t !== undefined && t !== null && typeof t === 'object') {
+    if (t.enabled === false) pref = false;
+    else if (t.enabled === true || t.type === 'enabled') pref = true;
+  }
+
+  return pref;
 }
 
 function extractTextFromMessages(messages) {
@@ -446,11 +520,24 @@ async function openEventStream(signal) {
 
 // True token streaming: prompts via prompt_async (204 immediately) and
 // forwards the backend's message.part.delta events as OpenAI SSE chunks until
-// session.idle. Failures after headers are sent become
+// session.idle. Thinking deltas are forwarded as `reasoning_content` chunks
+// only when the client opts in (includeReasoning); otherwise they are dropped
+// and content stays clean. Failures after headers are sent become
 // `data: {"error": ...}` followed by [DONE]. A client disconnect aborts the
 // backend run via /session/{id}/abort.
 async function streamFromBackend(opts) {
-  const { res, sessionId, promptPayload, model, completionId, created, textMode, includeUsage } = opts;
+  const { res, sessionId, promptPayload, model, completionId, created, textMode, includeUsage, includeReasoning } = opts;
+  const wantReasoning = !!includeReasoning && !textMode; // text_completion chunks have no reasoning channel
+  // partIDs known to hold thinking. The backend may stream reasoning with
+  // field "reasoning", or with field "text" on a reasoning part — tracking
+  // part types via message.part.updated covers both shapes.
+  const reasoningPartIds = new Set();
+  const eventSessionId = (props) =>
+    props.sessionID ?? props.sessionId ?? props.session_id ??
+    (props.part && (props.part.sessionID ?? props.part.sessionId ?? props.part.session_id));
+  const eventPartId = (props) =>
+    props.partID ?? props.partId ?? props.part_id ??
+    (props.part && (props.part.id ?? props.part.partID));
   const timeoutMs = OPENCODE_MESSAGE_TIMEOUT;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -538,13 +625,28 @@ async function streamFromBackend(opts) {
     for await (const evt of events) {
       if (clientGone) break;
       const props = (evt && evt.properties) || {};
-      if (props.sessionID !== sessionId) continue;
+      const sid = eventSessionId(props);
+      if (sid !== undefined && sid !== sessionId) continue;
+      if (evt.type === 'message.part.updated') {
+        // Authoritative part snapshot: remember reasoning parts so their
+        // deltas route to reasoning_content even when field is "text".
+        const part = props.part;
+        const pid = eventPartId(props);
+        if (part && part.type === 'reasoning' && pid !== undefined) reasoningPartIds.add(pid);
+        continue;
+      }
       if (
         evt.type === 'message.part.delta' &&
-        typeof props.delta === 'string' &&
-        (props.field === 'text' || props.field === undefined)
+        typeof props.delta === 'string'
       ) {
-        writeChunk(textMode ? props.delta : { content: props.delta }, null);
+        const pid = eventPartId(props);
+        const isReasoning =
+          props.field === 'reasoning' || (pid !== undefined && reasoningPartIds.has(pid));
+        if (isReasoning) {
+          if (wantReasoning) writeChunk({ reasoning_content: props.delta }, null);
+        } else if (props.field === 'text' || props.field === undefined) {
+          writeChunk(textMode ? props.delta : { content: props.delta }, null);
+        }
       } else if (evt.type === 'session.idle') {
         break;
       } else if (evt.type === 'session.error') {
@@ -614,7 +716,8 @@ async function streamFromBackend(opts) {
   finish();
 }
 
-async function doChatCompletion(messages, modelStr, stream, sessionId, includeUsage, res) {
+async function doChatCompletion(messages, modelStr, stream, sessionId, includeUsage, res, opts) {
+  const reasoningPref = (opts && opts.reasoningPref) ?? null;
   let prepared;
   try {
     prepared = await prepareChat(messages, modelStr, sessionId);
@@ -632,6 +735,7 @@ async function doChatCompletion(messages, modelStr, stream, sessionId, includeUs
       created: Math.floor(Date.now() / 1000),
       textMode: false,
       includeUsage,
+      includeReasoning: reasoningPref === true,
     });
     return undefined;
   }
@@ -650,6 +754,11 @@ async function doChatCompletion(messages, modelStr, stream, sessionId, includeUs
   }
   const text = extractAssistantText(result);
   const tokens = extractTokens(result);
+  // Non-streaming always carries thinking when the backend produced it,
+  // unless the client explicitly disabled it.
+  const reasoning = reasoningPref === false ? '' : extractReasoningText(result);
+  const message = { role: 'assistant', content: text };
+  if (reasoning) message.reasoning_content = reasoning;
 
   return res.json({
     id: `chatcmpl-${randomUUID()}`,
@@ -660,7 +769,7 @@ async function doChatCompletion(messages, modelStr, stream, sessionId, includeUs
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: text },
+        message,
         finish_reason: 'stop',
       },
     ],
@@ -718,7 +827,8 @@ app.post('/v1/chat/completions', verifyAuth, async (req, res) => {
       !!data.stream,
       data.session_id || data.sessionId || null,
       !!(data.stream_options && data.stream_options.include_usage),
-      res
+      res,
+      { reasoningPref: resolveReasoningPref(data) }
     );
   } catch (e) {
     return sendBackendError(res, e, 'chat completion failed');
@@ -923,6 +1033,10 @@ if (require.main === module) {
 
 module.exports = app;
 module.exports.loadDotEnv = loadDotEnv;
+module.exports.resolveReasoningPref = resolveReasoningPref;
+module.exports.extractReasoningText = extractReasoningText;
+module.exports.extractReasoningFromMessages = extractReasoningFromMessages;
+module.exports.extractTokens = extractTokens;
 module.exports.parseArgs = parseArgs;
 module.exports.runSessionQuery = runSessionQuery;
 module.exports.backendFetch = backendFetch;
