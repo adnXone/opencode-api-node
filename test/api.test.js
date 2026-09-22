@@ -76,6 +76,12 @@ const backend = http.createServer(async (req, res) => {
         res.write(frame({ id: 'evt-2', type: 'message.part.delta', properties: { ...reasonBase, field: 'reasoning', delta: 'should be ignored' } }));
         // Backend quirk shape: text field on a reasoning part — must never leak into content.
         res.write(frame({ id: 'evt-2b', type: 'message.part.delta', properties: { ...reasonBase, field: 'text', delta: 'hidden-thought' } }));
+        // Snapshot-delta shape: thinking streamed via part.updated (no part.delta
+        // for prt-r2) — forwarded when opted in.
+        res.write(frame({ id: 'evt-2c', type: 'message.part.updated', properties: { part: { id: 'prt-r2', type: 'reasoning', sessionID: 'sess-mock' }, delta: 'extra-thought' } }));
+        // Dedupe guard: prt-reason already streamed via part.delta, so this
+        // snapshot delta must be suppressed even when opted in.
+        res.write(frame({ id: 'evt-2d', type: 'message.part.updated', properties: { part: { id: 'prt-reason', type: 'reasoning', sessionID: 'sess-mock' }, delta: 'dup-thought' } }));
         res.write(frame({ id: 'evt-3', type: 'message.part.delta', properties: { ...textBase, field: 'text', delta: 'reply' } }));
         res.write(frame({ id: 'evt-4', type: 'session.idle', properties: { sessionID: 'sess-mock' } }));
       } catch { /* client went away */ }
@@ -131,6 +137,19 @@ const backend = http.createServer(async (req, res) => {
       return send(200, {});
     }
     backendCalls.final.push(body);
+    // Backend error-in-200 shape: per-model failures (402 funds, unknown
+    // model, ...) arrive as HTTP 200 with info.error.
+    if (body.model && body.model.modelID === 'err-model') {
+      return send(200, {
+        info: {
+          error: {
+            name: 'APIError',
+            data: { message: 'Upstream request failed: nope', statusCode: 402 },
+          },
+        },
+        parts: [],
+      });
+    }
     return send(200, {
       parts: [
         { type: 'reasoning', text: 'mock thought' },
@@ -291,6 +310,8 @@ test('POST /v1/chat/completions (stream) yields SSE + [DONE]', async () => {
   assert.equal(contents.join(''), 'mock reply');
   assert.ok(!raw.includes('should be ignored'));
   assert.ok(!raw.includes('hidden-thought'));
+  assert.ok(!raw.includes('extra-thought'));
+  assert.ok(!raw.includes('dup-thought'));
   assert.ok(!raw.includes('reasoning_content'));
   // prompted via fire-and-forget prompt_async, not the blocking endpoint
   assert.equal(backendCalls.async.length, 1);
@@ -312,10 +333,28 @@ test('POST /v1/chat/completions (stream) forwards thinking with include_reasonin
   const raw = await r.text();
   assert.ok(raw.includes('data: [DONE]'));
   const thinking = [...raw.matchAll(/"reasoning_content":"(.*?)"/g)].map((m) => m[1]);
-  assert.equal(thinking.join(''), 'should be ignoredhidden-thought');
+  // delta shapes (reasoning field, text field on reasoning part, snapshot
+  // delta) all forward; the duplicate snapshot delta is suppressed
+  assert.equal(thinking.join(''), 'should be ignoredhidden-thoughtextra-thought');
+  assert.ok(!raw.includes('dup-thought'));
   // content stays clean — thinking never leaks into it
   const contents = [...raw.matchAll(/"content":"(.*?)"/g)].map((m) => m[1]);
   assert.equal(contents.join(''), 'mock reply');
+});
+
+test('POST /v1/chat/completions surfaces backend error-in-200 loudly', async () => {
+  const r = await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({
+      model: 'err-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  assert.equal(r.status, 500);
+  const body = await r.json();
+  assert.equal(body.error.code, 'backend_error');
+  assert.match(body.error.message, /nope/);
 });
 
 test('POST /v1/chat/completions (non-stream) includes reasoning_content', async () => {
@@ -347,6 +386,38 @@ test('POST /v1/chat/completions (non-stream) drops thinking when disabled', asyn
   const body = await r.json();
   assert.equal(body.choices[0].message.content, 'mock reply');
   assert.ok(!('reasoning_content' in body.choices[0].message));
+});
+
+test('streaming sends heartbeat comments while the backend works', async () => {
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: mockBase,
+      API_KEY,
+      STREAM_HEARTBEAT_MS: '10',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...auth },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      }),
+    });
+    assert.equal(r.status, 200);
+    const raw = await r.text();
+    assert.ok(raw.includes(':\n\n'), 'expected SSE heartbeat comment');
+    assert.ok(raw.includes('data: [DONE]'));
+  } finally {
+    proc.kill();
+  }
 });
 
 test('POST /v1/chat/completions (stream) honors include_usage', async () => {
@@ -516,6 +587,20 @@ test('resolveReasoningPref handles thinking aliases', () => {
   assert.equal(resolveReasoningPref({ enable_thinking: false }), false);
 });
 
+test('throwIfBackendError / lastMessageError surface failures', () => {
+  const { throwIfBackendError, lastMessageError } = require('../server.js');
+  assert.doesNotThrow(() => throwIfBackendError({ parts: [] }));
+  assert.doesNotThrow(() => throwIfBackendError({ info: { tokens: {} }, parts: [] }));
+  assert.throws(
+    () => throwIfBackendError({ info: { error: { name: 'APIError', data: { message: 'boom' } } } }),
+    /boom/
+  );
+  assert.equal(lastMessageError([]), null);
+  assert.equal(lastMessageError([{ info: {}, parts: [] }]), null);
+  const err = { name: 'APIError', data: { message: 'funds' } };
+  assert.equal(lastMessageError([{ info: {} }, { info: { error: err } }]), err);
+});
+
 test('extractReasoningText / extractTokens cover thinking', () => {
   const { extractReasoningText, extractTokens } = require('../server.js');
   assert.equal(extractReasoningText({ parts: [{ type: 'text', text: 'hi' }] }), '');
@@ -546,8 +631,195 @@ test('parseArgs handles --port forms and rejects bad input', () => {
   assert.deepEqual(parseArgs(['--port=1234']), { port: '1234' });
   assert.deepEqual(parseArgs(['--help']), { help: true });
   assert.deepEqual(parseArgs(['-h']), { help: true });
+  assert.deepEqual(parseArgs(['help']), { help: true });
+  assert.throws(() => parseArgs(['help', '--port', '1']), /unknown argument/);
   assert.throws(() => parseArgs(['--bogus']), /unknown argument/);
   assert.throws(() => parseArgs(['--port']), /requires a value/);
+});
+
+test('ENABLE_STREAMING=0 downgrades streams to blocking JSON', async () => {
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: mockBase,
+      API_KEY,
+      ENABLE_STREAMING: '0',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...auth },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      }),
+    });
+    assert.equal(r.status, 200);
+    assert.ok(!String(r.headers.get('content-type')).includes('text/event-stream'));
+    const body = await r.json();
+    assert.equal(body.object, 'chat.completion');
+    assert.equal(body.choices[0].message.content, 'mock reply');
+  } finally {
+    proc.kill();
+  }
+});
+
+test('CORS headers appear only when CORS_ORIGIN is set', async () => {
+  // default server: no CORS headers (behavior unchanged)
+  const plain = await fetch(`${base}/health`);
+  assert.equal(plain.headers.get('access-control-allow-origin'), null);
+
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: mockBase,
+      API_KEY,
+      CORS_ORIGIN: 'https://example.com',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    const h = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(h.headers.get('access-control-allow-origin'), 'https://example.com');
+    // preflight ends before auth — no bearer needed
+    const pre = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'OPTIONS',
+    });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers.get('access-control-allow-origin'), 'https://example.com');
+  } finally {
+    proc.kill();
+  }
+});
+
+test('HOST bind + request logging to stdout', async () => {
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS, '--host', '127.0.0.1'], {
+    env: { ...process.env, PORT: String(port), OPENCODE_URL: mockBase, API_KEY },
+    stdio: 'pipe',
+  });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.match(out, /listening on 127\.0\.0\.1:/);
+    assert.match(out, /GET \/health 200/);
+  } finally {
+    proc.kill();
+  }
+});
+
+test('VISION_MODEL override changes the forced vision model', async () => {
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: mockBase,
+      API_KEY,
+      VISION_MODEL: 'custom-vision',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    backendCalls.final.length = 0;
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...auth },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+          ],
+        }],
+      }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(backendCalls.final[0].model.modelID, 'custom-vision');
+  } finally {
+    proc.kill();
+  }
+});
+
+test('INCLUDE_REASONING=1 streams thinking without the flag', async () => {
+  const port = await getFreePort();
+  const proc = spawn(process.execPath, [SERVER_JS], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENCODE_URL: mockBase,
+      API_KEY,
+      INCLUDE_REASONING: '1',
+    },
+    stdio: 'pipe',
+  });
+  try {
+    await waitForHealth(`http://127.0.0.1:${port}`);
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...auth },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      }),
+    });
+    assert.equal(r.status, 200);
+    const raw = await r.text();
+    assert.ok(raw.includes('"reasoning_content"'));
+  } finally {
+    proc.kill();
+  }
+});
+
+test('parseEnabled / parseArgs cover the streaming switch', () => {
+  const { parseEnabled, parseArgs } = require('../server.js');
+  assert.equal(parseEnabled(undefined, true), true);
+  assert.equal(parseEnabled('', true), true);
+  assert.equal(parseEnabled('0', true), false);
+  assert.equal(parseEnabled('false', true), false);
+  assert.equal(parseEnabled('off', true), false);
+  assert.equal(parseEnabled('1', false), true);
+  assert.equal(parseEnabled('yes', false), true);
+  assert.equal(parseEnabled('bogus', true), true);
+  assert.equal(parseEnabled('bogus', false), false);
+  assert.deepEqual(parseArgs(['--no-streaming']), { streaming: false });
+  assert.deepEqual(parseArgs(['--streaming']), { streaming: true });
+});
+
+test('parseArgs covers host/cors/vision/reasoning/log/version flags', () => {
+  const { parseArgs, parseLogLevel } = require('../server.js');
+  assert.deepEqual(parseArgs(['--host', '127.0.0.1']), { host: '127.0.0.1' });
+  assert.deepEqual(parseArgs(['--host=::1']), { host: '::1' });
+  assert.deepEqual(parseArgs(['--cors', 'https://x.example']), { cors: 'https://x.example' });
+  assert.deepEqual(parseArgs(['--cors=*']), { cors: '*' });
+  assert.deepEqual(parseArgs(['--vision_model', 'v']), { visionModel: 'v' });
+  assert.deepEqual(parseArgs(['--vision-model=v2']), { visionModel: 'v2' });
+  assert.deepEqual(parseArgs(['--include_reasoning']), { includeReasoning: true });
+  assert.deepEqual(parseArgs(['--no-include-reasoning']), { includeReasoning: false });
+  assert.deepEqual(parseArgs(['--log_level', 'debug']), { logLevel: 'debug' });
+  assert.deepEqual(parseArgs(['--log-level=warn']), { logLevel: 'warn' });
+  assert.deepEqual(parseArgs(['--version']), { version: true });
+  assert.deepEqual(parseArgs(['-v']), { version: true });
+  assert.throws(() => parseArgs(['--host']), /requires a value/);
+  assert.throws(() => parseArgs(['--cors']), /requires a value/);
+  assert.equal(parseLogLevel('debug', 'info'), 'debug');
+  assert.equal(parseLogLevel('VERBOSE', 'info'), 'info');
+  assert.equal(parseLogLevel(undefined, 'warn'), 'warn');
 });
 
 test('parseArgs handles backend/auth/session flags', () => {
@@ -584,6 +856,20 @@ test('--session <id> shows detail with messages', async () => {
   assert.equal(data.id, 'ses-list-1');
   assert.ok(Array.isArray(data.messages));
   assert.equal(data.messages[0].id, 'msg-1');
+});
+
+test('--help documents endpoints/examples and bare help works', async () => {
+  const { stdout } = await execFileAsync(process.execPath, [SERVER_JS, '--help'], {
+    timeout: 20000,
+  });
+  assert.ok(stdout.includes('Endpoints'));
+  assert.ok(stdout.includes('Examples'));
+  assert.ok(stdout.includes('Exit codes'));
+  assert.ok(stdout.includes('/v1/chat/completions'));
+  const { stdout: bare } = await execFileAsync(process.execPath, [SERVER_JS, 'help'], {
+    timeout: 20000,
+  });
+  assert.ok(bare.includes('Usage:'));
 });
 
 test('--session <unknown> exits non-zero', async () => {

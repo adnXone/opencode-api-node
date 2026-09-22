@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-22
+
+### Fixed
+
+- Thinking works with any model that exposes plaintext reasoning, not just
+  one delta shape: recognized delta fields are now `reasoning`,
+  `reasoning_text`, and `thinking`, and thinking streamed via
+  `message.part.updated` snapshot deltas is forwarded too (with a dedupe
+  guard so backends sending both shapes never emit it twice). Verified
+  live against `mimo-v2.6-flash-free` (non-streaming `reasoning_content`,
+  opt-in streaming deltas, clean `content` by default).
+- Backend per-model failures that arrive as HTTP 200 with `info.error`
+  (e.g. `402 Insufficient account funds`, found live on non-free models)
+  no longer return an empty 200: non-streaming endpoints answer `500
+  backend_error` with the upstream message, and streams end with an error
+  frame instead of a clean-but-empty `[DONE]`.
+- Long agentic runs no longer look hung: streams now send an SSE heartbeat
+  comment every `STREAM_HEARTBEAT_MS` (default 15000, `0` disables), so
+  client/proxy idle timeouts don't kill runs while the backend works tools
+  with no text deltas. Verified live (heartbeat interleaved mid-run,
+  clean `[DONE]`).
+- Streaming master switch: `ENABLE_STREAMING=0` (or `--no-streaming`;
+  `--streaming` re-enables) serves `stream: true` requests blocking as
+  regular JSON instead of SSE, so strict clients keep working. Forcing
+  streaming onto non-streaming requests is deliberately not offered.
+- Ops config gaps closed: `HOST` bind address (`--host`, default keeps
+  `0.0.0.0` for Docker; use `127.0.0.1` for localhost-only no-auth use),
+  `CORS_ORIGIN` (`--cors`, off by default; preflights bypass auth),
+  `VISION_MODEL` (`--vision_model`, was hardcoded),
+  `INCLUDE_REASONING` (`--include_reasoning`, default-on thinking for
+  clients that can't send the flag), `LOG_LEVEL` (`--log_level`,
+  `error|warn|info|debug`, request lines without bodies/keys), and a
+  `--version`/`-v` flag.
+- Help for humans and agents: bare `help` subcommand (`node server.js
+  help`) plus richer `--help` with endpoints, request-field hints,
+  copy-paste examples, and exit codes.
+
+### Notes
+
+- Some models (observed: `muse-spark-1.3-contributor-free`) keep thinking
+  encrypted server-side (`reasoningEncryptedContent`, empty text, zero
+  deltas). For those only `usage.completion_tokens_details.reasoning_tokens`
+  comes through — there is no plaintext for the adapter to forward.
+
 ## [1.2.0] - 2026-09-22
 
 ### Added

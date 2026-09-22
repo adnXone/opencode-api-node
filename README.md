@@ -208,9 +208,20 @@ curl -X POST http://localhost:80/v1/chat/completions \
 | `OPENCODE_TIMEOUT` | `15000` | Control-plane backend timeout in ms (health, models, sessions) |
 | `OPENCODE_MESSAGE_TIMEOUT` | `300000` | Generation timeout in ms (blocking and streaming) |
 | `OPENCODE_RETRIES` | `1` | Extra attempts on network-level backend failures |
+| `STREAM_HEARTBEAT_MS` | `15000` | SSE heartbeat interval in ms for streams (`0` disables) |
+| `ENABLE_STREAMING` | `1` | Master switch: `0` serves `stream: true` requests blocking as JSON |
+| `HOST` | `0.0.0.0` | Bind address (`127.0.0.1` = localhost only) |
+| `CORS_ORIGIN` | (empty) | Enable CORS for this origin (`*` for any); empty = off |
+| `VISION_MODEL` | `qwen3.6-plus-free` | Vision model forced when messages contain images |
+| `INCLUDE_REASONING` | `0` | Default-on thinking when requests say nothing |
+| `LOG_LEVEL` | `info` | `error\|warn\|info\|debug` request logging (no bodies/keys) |
 
 CLI flags override the env vars above: `--port <n>`, `--opencode_url <url>`
-(`--opencode-url` also works), `--api_key <key>` (`--api-key` also works).
+(`--opencode-url` also works), `--api_key <key>` (`--api-key` also works),
+`--streaming` / `--no-streaming` (overrides `ENABLE_STREAMING`),
+`--host <addr>`, `--cors <origin>`, `--vision_model <m>`,
+`--include_reasoning` / `--no-include_reasoning`,
+`--log_level <lvl>`, `--version` (`-v`).
 `--session [<id>]` queries session data from the backend instead of starting
 the server.
 
@@ -246,10 +257,16 @@ Aliases accepted: `include_thinking`, `stream_options.include_reasoning`,
 `reasoning` / `reasoning_effort`, `thinking` / `enable_thinking`
 (`reasoning: { effort: "none" }` disables thinking output). These only gate
 adapter output — effort itself is tuned via opencode model variants, and the
-aliases are never forwarded to the backend. `usage` gains
-`completion_tokens_details.reasoning_tokens` when the backend reports it.
-`/v1/completions` (legacy text endpoint) omits thinking — use chat
-completions for reasoning models.
+aliases are never forwarded to the backend. Any model that exposes plaintext
+reasoning works: delta fields `reasoning` / `reasoning_text` / `thinking`,
+`text` deltas on reasoning parts, and snapshot deltas are all covered.
+`usage` gains `completion_tokens_details.reasoning_tokens` when the backend
+reports it. `/v1/completions` (legacy text endpoint) omits thinking — use chat
+completions for reasoning models. Models that keep thinking encrypted
+server-side expose counts only, no text. Per-model backend failures that
+arrive as HTTP 200 with `info.error` (e.g. insufficient funds) surface as
+`500 backend_error` (non-streaming) or a terminal error frame (streaming)
+instead of an empty success.
 
 ## Tests
 
@@ -320,7 +337,11 @@ MIT — see [LICENSE](./LICENSE).
   `usage` block on the final chunk. Thinking streams as
   `delta.reasoning_content` only with `include_reasoning: true`; reasoning
   parts are tracked via `message.part.updated` so thinking never leaks into
-  `content`.
+  `content`. While the backend works (e.g. tool calls with no text deltas)
+  the stream stays alive with an SSE heartbeat comment every
+  `STREAM_HEARTBEAT_MS` (default 15000 ms, `0` disables) — use streaming
+  (not blocking) for long agentic tasks, and raise
+  `OPENCODE_MESSAGE_TIMEOUT` past the longest expected run.
 - `session_id` (also accepted as `sessionId`) pins turns to one backend session;
   without it each request gets a fresh session with the history replayed.
   Responses echo the id back as `session_id`.

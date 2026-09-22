@@ -13,6 +13,15 @@
 //   OPENCODE_MESSAGE_TIMEOUT Generation timeout in ms (blocking + stream).  (default: "300000")
 //   OPENCODE_RETRIES         Extra attempts on network-level backend
 //                            failures (timeouts, refused connections).       (default: "1")
+//   STREAM_HEARTBEAT_MS      SSE heartbeat interval in ms for streams, keeps
+//                            long runs alive through idle timeouts.          (default: "15000", "0" disables)
+//   ENABLE_STREAMING         Master switch for SSE streaming. 0/false serves
+//                            stream requests blocking as JSON instead.       (default: "1")
+//   HOST                     Bind address, 127.0.0.1 = localhost only.      (default: "0.0.0.0")
+//   CORS_ORIGIN              Enable CORS for this origin ("*"), empty = off. (default: "")
+//   VISION_MODEL             Vision model forced on image input.             (default: "qwen3.6-plus-free")
+//   INCLUDE_REASONING        Default-on thinking when requests say nothing. (default: "0")
+//   LOG_LEVEL                error|warn|info|debug request logging.          (default: "info")
 
 const express = require('express');
 const { randomUUID } = require('crypto');
@@ -78,6 +87,44 @@ let OPENCODE_TIMEOUT = parsePositiveInt(process.env.OPENCODE_TIMEOUT, 15000);
 let OPENCODE_MESSAGE_TIMEOUT = parsePositiveInt(process.env.OPENCODE_MESSAGE_TIMEOUT, 300000);
 let OPENCODE_RETRIES = parseNonNegativeInt(process.env.OPENCODE_RETRIES, 1);
 
+function parseEnabled(raw, fallback) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const s = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(s)) return false;
+  return fallback;
+}
+
+// When false, `stream: true` requests are completed blocking and returned
+// as regular JSON instead of SSE (graceful downgrade — clients keep
+// working, just all-at-once). Forcing streaming on non-streaming requests
+// is deliberately not offered: it would break clients expecting JSON.
+let STREAMING_ENABLED = parseEnabled(process.env.ENABLE_STREAMING, true);
+
+// Default-on thinking for clients that cannot send `include_reasoning`:
+// explicit request prefs still win, this only fills the gap when the
+// request says nothing.
+let INCLUDE_REASONING = parseEnabled(process.env.INCLUDE_REASONING, false);
+
+function parseLogLevel(raw, fallback) {
+  const s = String(raw === undefined || raw === null ? fallback : raw).trim().toLowerCase();
+  return ['error', 'warn', 'info', 'debug'].includes(s) ? s : fallback;
+}
+
+const LOG_ORDER = { error: 0, warn: 1, info: 2, debug: 3 };
+let LOG_LEVEL = parseLogLevel(process.env.LOG_LEVEL, 'info');
+
+function log(level, ...args) {
+  if (LOG_ORDER[level] <= LOG_ORDER[LOG_LEVEL]) {
+    // eslint-disable-next-line no-console
+    console.log(...args);
+  }
+}
+
+let HOST = process.env.HOST || '0.0.0.0';
+let CORS_ORIGIN = process.env.CORS_ORIGIN || '';
+let VISION_MODEL = process.env.VISION_MODEL || 'qwen3.6-plus-free';
+
 const MIME_MAP = {
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
@@ -86,7 +133,7 @@ const MIME_MAP = {
   webp: 'image/webp',
   bmp: 'image/bmp',
 };
-const VISION_MODEL = 'qwen3.6-plus-free';
+
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -391,6 +438,31 @@ async function convertOpenaiContentToParts(content) {
 }
 
 const app = express();
+// Minimal CORS without dependencies. Enabled only when CORS_ORIGIN is set
+// ("*" or one origin, echoed verbatim — never reflected). Preflights end
+// here so they never reach auth.
+app.use((req, res, next) => {
+  if (!CORS_ORIGIN) return next();
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (CORS_ORIGIN !== '*') res.setHeader('Vary', 'Origin');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  return next();
+});
+
+// Request log: method path status duration. Bodies and keys never logged.
+// SSE streams log once, when the stream ends.
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => {
+    const line = `${req.method} ${req.path} ${res.statusCode} ${Date.now() - t0}ms`;
+    if (res.statusCode >= 500) log('warn', line);
+    else log('info', line);
+  });
+  next();
+});
+
 app.use(express.json({ limit: '50mb' }));
 
 async function prepareChat(messages, modelStr, sessionId) {
@@ -518,6 +590,37 @@ async function openEventStream(signal) {
   return gen();
 }
 
+// Delta `field` values that carry thinking on message.part.delta events.
+// "text" (or missing) stays the content channel; anything else unknown is
+// ignored.
+const REASONING_FIELDS = new Set(['reasoning', 'reasoning_text', 'thinking']);
+
+// The backend answers HTTP 200 with the failure inside { info: { error } }
+// for per-model errors (402 funds, unknown model, upstream 5xx, ...).
+// Surface those loudly instead of returning an empty 200.
+function describeBackendError(err) {
+  const data = (err && err.data) || {};
+  return `opencode backend error: ${data.message || (err && err.message) || 'unknown backend error'}`;
+}
+
+function throwIfBackendError(result) {
+  const err = result && (result.info ? result.info.error : result.error);
+  if (err) throw new Error(describeBackendError(err));
+}
+
+// Newest-first scan of a GET /session/{id}/message list for a terminal
+// backend failure (used after streaming to fail loudly instead of ending
+// cleanly on an errored run).
+function lastMessageError(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const err = m && m.info && m.info.error;
+    if (err) return err;
+  }
+  return null;
+}
+
 // True token streaming: prompts via prompt_async (204 immediately) and
 // forwards the backend's message.part.delta events as OpenAI SSE chunks until
 // session.idle. Thinking deltas are forwarded as `reasoning_content` chunks
@@ -529,9 +632,12 @@ async function streamFromBackend(opts) {
   const { res, sessionId, promptPayload, model, completionId, created, textMode, includeUsage, includeReasoning } = opts;
   const wantReasoning = !!includeReasoning && !textMode; // text_completion chunks have no reasoning channel
   // partIDs known to hold thinking. The backend may stream reasoning with
-  // field "reasoning", or with field "text" on a reasoning part — tracking
-  // part types via message.part.updated covers both shapes.
+  // field "reasoning" (or aliases), or with field "text" on a reasoning
+  // part — tracking part types via message.part.updated covers both shapes.
   const reasoningPartIds = new Set();
+  // partIDs already seen on message.part.delta: snapshot deltas for those
+  // parts are ignored (dedupe guard, see below).
+  const seenDeltaPartIds = new Set();
   const eventSessionId = (props) =>
     props.sessionID ?? props.sessionId ?? props.session_id ??
     (props.part && (props.part.sessionID ?? props.part.sessionId ?? props.part.session_id));
@@ -571,6 +677,7 @@ async function streamFromBackend(opts) {
   let finished = false;
   let clientGone = false;
   let timedOut = false;
+  let heartbeat = null;
   const ctrl = new AbortController();
   const timer = setTimeout(() => {
     timedOut = true;
@@ -579,6 +686,7 @@ async function streamFromBackend(opts) {
   const finish = () => {
     finished = true;
     clearTimeout(timer);
+    if (heartbeat !== null) clearInterval(heartbeat);
     res.removeListener('close', onResClose);
   };
   const onResClose = () => {
@@ -593,6 +701,22 @@ async function streamFromBackend(opts) {
     ).catch(() => {});
   };
   res.on('close', onResClose);
+
+  // Keep long agentic runs alive through client/proxy idle timeouts: while
+  // the backend works tools (no text deltas), the stream would otherwise
+  // look dead and Hermes-style clients appear to hang. SSE comments are
+  // ignored by event parsers. Tunable via STREAM_HEARTBEAT_MS (default
+  // 15000, 0 disables); read per request so tests can override per spawn.
+  const heartbeatMs = parseNonNegativeInt(process.env.STREAM_HEARTBEAT_MS, 15000);
+  if (heartbeatMs > 0) {
+    heartbeat = setInterval(() => {
+      if (finished || clientGone) return;
+      try {
+        res.write(':\n\n');
+      } catch { /* ignore */ }
+    }, heartbeatMs);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+  }
 
   const fail = (message, code) => {
     if (clientGone) { finish(); return; }
@@ -632,7 +756,24 @@ async function streamFromBackend(opts) {
         // deltas route to reasoning_content even when field is "text".
         const part = props.part;
         const pid = eventPartId(props);
+        const isReasoningPart =
+          (part && part.type === 'reasoning') ||
+          (pid !== undefined && reasoningPartIds.has(pid));
         if (part && part.type === 'reasoning' && pid !== undefined) reasoningPartIds.add(pid);
+        // Fallback for backends that stream thinking via snapshot deltas
+        // instead of part.delta events. The dedupe guard (no part.delta
+        // seen for this part) prevents double emission when a backend
+        // sends both — and thinking never routes into text content.
+        if (
+          wantReasoning &&
+          isReasoningPart &&
+          typeof props.delta === 'string' &&
+          props.delta.length > 0 &&
+          pid !== undefined &&
+          !seenDeltaPartIds.has(pid)
+        ) {
+          writeChunk({ reasoning_content: props.delta }, null);
+        }
         continue;
       }
       if (
@@ -640,8 +781,10 @@ async function streamFromBackend(opts) {
         typeof props.delta === 'string'
       ) {
         const pid = eventPartId(props);
+        if (pid !== undefined) seenDeltaPartIds.add(pid);
         const isReasoning =
-          props.field === 'reasoning' || (pid !== undefined && reasoningPartIds.has(pid));
+          (typeof props.field === 'string' && REASONING_FIELDS.has(props.field)) ||
+          (pid !== undefined && reasoningPartIds.has(pid));
         if (isReasoning) {
           if (wantReasoning) writeChunk({ reasoning_content: props.delta }, null);
         } else if (props.field === 'text' || props.field === undefined) {
@@ -678,6 +821,7 @@ async function streamFromBackend(opts) {
   if (clientGone) { finish(); return; }
   // Usage accounting + text fallback (tool-only replies emit no text deltas).
   let usage;
+  let terminalError = null;
   try {
     const mResp = await backendFetch(
       `${OPENCODE_URL}/session/${encodeURIComponent(sessionId)}/message`,
@@ -688,9 +832,20 @@ async function streamFromBackend(opts) {
     if (mResp.ok) {
       const messages = await mResp.json();
       usage = extractUsageFromMessages(messages);
+      const err = lastMessageError(messages);
+      if (err) terminalError = describeBackendError(err);
     }
   } catch {
     // usage stays undefined — the stream still closes cleanly
+  }
+  // The run errored server-side (e.g. 402 funds): fail loudly with an error
+  // frame instead of ending a clean-but-empty stream.
+  if (terminalError) {
+    write({ error: { message: terminalError, type: 'server_error', code: 'backend_error', param: null } });
+    writeDone();
+    try { res.end(); } catch { /* ignore */ }
+    finish();
+    return;
   }
   const final = textMode
     ? {
@@ -749,6 +904,7 @@ async function doChatCompletion(messages, modelStr, stream, sessionId, includeUs
     );
     if (!resp.ok) throw new Error(`opencode backend returned status ${resp.status}`);
     result = await resp.json();
+    throwIfBackendError(result);
   } catch (e) {
     return sendBackendError(res, e, 'chat completion failed');
   }
@@ -820,15 +976,17 @@ app.get('/v1/models', verifyAuth, async (req, res) => {
 
 app.post('/v1/chat/completions', verifyAuth, async (req, res) => {
   const data = req.body || {};
+  let reasoningPref = resolveReasoningPref(data);
+  if (reasoningPref === null && INCLUDE_REASONING) reasoningPref = true;
   try {
     await doChatCompletion(
       data.messages || [],
       data.model || '',
-      !!data.stream,
+      !!data.stream && STREAMING_ENABLED,
       data.session_id || data.sessionId || null,
       !!(data.stream_options && data.stream_options.include_usage),
       res,
-      { reasoningPref: resolveReasoningPref(data) }
+      { reasoningPref }
     );
   } catch (e) {
     return sendBackendError(res, e, 'chat completion failed');
@@ -839,7 +997,7 @@ app.post('/v1/completions', verifyAuth, async (req, res) => {
   const data = req.body || {};
   let prompt = data.prompt !== undefined ? data.prompt : '';
   if (Array.isArray(prompt)) prompt = prompt.join('\n');
-  const stream = !!data.stream;
+  const stream = !!data.stream && STREAMING_ENABLED;
   const sessionId = data.session_id || data.sessionId || null;
   const includeUsage = !!(data.stream_options && data.stream_options.include_usage);
 
@@ -878,6 +1036,7 @@ app.post('/v1/completions', verifyAuth, async (req, res) => {
     );
     if (!resp.ok) throw new Error(`opencode backend returned status ${resp.status}`);
     const result = await resp.json();
+    throwIfBackendError(result);
     text = extractAssistantText(result);
     tokens = extractTokens(result);
   } catch (e) {
@@ -906,7 +1065,7 @@ app.use((err, req, res, next) => {
 function printUsage() {
   // eslint-disable-next-line no-console
   console.log(`Usage:
-  node server.js [--port <n>] [--opencode_url <url>] [--api_key <key>]   Start the adapter
+  node server.js [options]                 Start the adapter
   node server.js --session [--opencode_url <url>]                        List backend sessions
   node server.js --session <id> [--opencode_url <url>]                   Show one session + its messages
 
@@ -916,6 +1075,16 @@ Options:
                                          --opencode-url also accepted)
   --api_key <key>                        Bearer token for auth (overrides API_KEY env var,
                                          --api-key also accepted)
+  --streaming / --no-streaming         Enable/disable SSE streaming (overrides ENABLE_STREAMING;
+                                     disabled serves stream requests blocking as JSON)
+  --host <addr>, --host=<addr>         Bind address (overrides HOST env var)
+  --cors <origin>, --cors=<origin>     Enable CORS for this origin ("*" for any)
+  --vision_model <m>                   Vision model forcing on image input
+                                       (--vision-model also accepted)
+  --include_reasoning /                Default-on thinking when the request says
+    --no-include_reasoning             nothing (overrides INCLUDE_REASONING)
+  --log_level <lvl>                    error|warn|info|debug (--log-level also accepted)
+  --version, -v                        Print version and exit
   --session [<id>]                       Query session data from the backend instead of starting
                                          the server: no <id> lists sessions, with <id> shows
                                          that session including its messages (JSON to stdout)
@@ -927,7 +1096,38 @@ Env:
   API_KEY                  Bearer token for auth, empty = no auth (default: empty)
   OPENCODE_TIMEOUT         Control-plane backend timeout in ms (default: 15000)
   OPENCODE_MESSAGE_TIMEOUT Generation timeout in ms, blocking and stream (default: 300000)
-  OPENCODE_RETRIES         Extra attempts on network-level backend failures (default: 1)`);
+  OPENCODE_RETRIES         Extra attempts on network-level backend failures (default: 1)
+  STREAM_HEARTBEAT_MS      SSE heartbeat interval in ms for streams (default: 15000, 0 disables)
+  ENABLE_STREAMING         Master switch for SSE streaming (default: 1).
+                           0/false disables: stream requests complete blocking
+                           as JSON instead (--no-streaming flag also works)
+  HOST                     Bind address, 127.0.0.1 = localhost only (default: 0.0.0.0)
+  CORS_ORIGIN              Enable CORS for this origin ("*"), empty = off (default: empty)
+  VISION_MODEL             Vision model forced on image input (default: qwen3.6-plus-free)
+  INCLUDE_REASONING        Default-on thinking when requests say nothing (default: 0)
+  LOG_LEVEL                error|warn|info|debug request logging (default: info)
+
+Endpoints (OpenAI-compatible, base http://<host>:<port>):
+  GET  /  /health              Liveness + backend reachability
+  GET  /v1/models              Model list (opencode provider only)
+  POST /v1/chat/completions    Chat completions. stream:true for SSE,
+                               include_reasoning:true for thinking deltas,
+                               session_id to pin a conversation turn
+  POST /v1/completions         Legacy text completions (no thinking)
+
+Examples:
+  PORT=55890 node server.js
+  node server.js --port 55890 --opencode_url http://127.0.0.1:4096
+  curl http://127.0.0.1:55890/health
+  curl -N -X POST http://127.0.0.1:55890/v1/chat/completions \\
+    -H 'Content-Type: application/json' \\
+    -d '{"model":"mimo-v2.6-flash-free",
+         "messages":[{"role":"user","content":"Hi"}],
+         "stream":true,"include_reasoning":true}'
+
+Exit codes:
+  0  success (including --help / --version / --session output)
+  1  bad arguments, invalid port, or failed session query`);
 }
 
 function parseArgs(argv) {
@@ -953,6 +1153,40 @@ function parseArgs(argv) {
       opts.apiKey = arg.slice('--api_key='.length);
     } else if (arg.startsWith('--api-key=')) {
       opts.apiKey = arg.slice('--api-key='.length);
+    } else if (arg === '--streaming') {
+      opts.streaming = true;
+    } else if (arg === '--no-streaming') {
+      opts.streaming = false;
+    } else if (arg === '--host') {
+      if (i + 1 >= argv.length) throw new Error('--host requires a value');
+      opts.host = argv[++i];
+    } else if (arg.startsWith('--host=')) {
+      opts.host = arg.slice('--host='.length);
+    } else if (arg === '--cors') {
+      if (i + 1 >= argv.length) throw new Error('--cors requires a value');
+      opts.cors = argv[++i];
+    } else if (arg.startsWith('--cors=')) {
+      opts.cors = arg.slice('--cors='.length);
+    } else if (arg === '--vision_model' || arg === '--vision-model') {
+      if (i + 1 >= argv.length) throw new Error(`${arg} requires a value`);
+      opts.visionModel = argv[++i];
+    } else if (arg.startsWith('--vision_model=')) {
+      opts.visionModel = arg.slice('--vision_model='.length);
+    } else if (arg.startsWith('--vision-model=')) {
+      opts.visionModel = arg.slice('--vision-model='.length);
+    } else if (arg === '--include_reasoning' || arg === '--include-reasoning') {
+      opts.includeReasoning = true;
+    } else if (arg === '--no-include_reasoning' || arg === '--no-include-reasoning') {
+      opts.includeReasoning = false;
+    } else if (arg === '--log_level' || arg === '--log-level') {
+      if (i + 1 >= argv.length) throw new Error(`${arg} requires a value`);
+      opts.logLevel = argv[++i];
+    } else if (arg.startsWith('--log_level=')) {
+      opts.logLevel = arg.slice('--log_level='.length);
+    } else if (arg.startsWith('--log-level=')) {
+      opts.logLevel = arg.slice('--log-level='.length);
+    } else if (arg === '--version' || arg === '-v') {
+      opts.version = true;
     } else if (arg === '--session') {
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('-')) {
@@ -961,6 +1195,11 @@ function parseArgs(argv) {
         opts.session = true; // list mode
       }
     } else if (arg === '--help' || arg === '-h') {
+      opts.help = true;
+    } else if (arg === 'help') {
+      // Bare `help` subcommand for humans and agents; anything else
+      // combined with it is a mistake, not a session id.
+      if (argv.length !== 1) throw new Error(`unknown argument: ${arg}`);
       opts.help = true;
     } else {
       throw new Error(`unknown argument: ${arg}`);
@@ -1011,8 +1250,23 @@ if (require.main === module) {
       printUsage();
       process.exit(0);
     }
+    if (cli.version) {
+      let pkgVersion = 'unknown';
+      try {
+        pkgVersion = require(path.join(__dirname, 'package.json')).version || pkgVersion;
+      } catch { /* ignore */ }
+      // eslint-disable-next-line no-console
+      console.log(`opencode-api-node ${pkgVersion}`);
+      process.exit(0);
+    }
     if (cli.opencodeUrl !== undefined) OPENCODE_URL = cli.opencodeUrl;
     if (cli.apiKey !== undefined) API_KEY = cli.apiKey;
+    if (cli.streaming !== undefined) STREAMING_ENABLED = cli.streaming;
+    if (cli.host !== undefined) HOST = cli.host;
+    if (cli.cors !== undefined) CORS_ORIGIN = cli.cors;
+    if (cli.visionModel !== undefined) VISION_MODEL = cli.visionModel;
+    if (cli.includeReasoning !== undefined) INCLUDE_REASONING = cli.includeReasoning;
+    if (cli.logLevel !== undefined) LOG_LEVEL = parseLogLevel(cli.logLevel, LOG_LEVEL);
     if (cli.session !== undefined) {
       await runSessionQuery(cli.session);
       return;
@@ -1024,9 +1278,13 @@ if (require.main === module) {
       console.error(`error: invalid port: ${raw}`);
       process.exit(1);
     }
-    app.listen(port, '0.0.0.0', () => {
+    app.listen(port, HOST, () => {
       // eslint-disable-next-line no-console
-      console.log(`opencode-api-node listening on 0.0.0.0:${port} -> ${OPENCODE_URL}`);
+      console.log(`opencode-api-node listening on ${HOST}:${port} -> ${OPENCODE_URL}`);
+      if (!STREAMING_ENABLED) {
+        // eslint-disable-next-line no-console
+        console.log('streaming disabled: stream requests complete blocking as JSON');
+      }
     });
   })();
 }
@@ -1034,10 +1292,14 @@ if (require.main === module) {
 module.exports = app;
 module.exports.loadDotEnv = loadDotEnv;
 module.exports.resolveReasoningPref = resolveReasoningPref;
+module.exports.throwIfBackendError = throwIfBackendError;
+module.exports.lastMessageError = lastMessageError;
 module.exports.extractReasoningText = extractReasoningText;
 module.exports.extractReasoningFromMessages = extractReasoningFromMessages;
 module.exports.extractTokens = extractTokens;
 module.exports.parseArgs = parseArgs;
+module.exports.parseEnabled = parseEnabled;
+module.exports.parseLogLevel = parseLogLevel;
 module.exports.runSessionQuery = runSessionQuery;
 module.exports.backendFetch = backendFetch;
 module.exports.extractUsageFromMessages = extractUsageFromMessages;
