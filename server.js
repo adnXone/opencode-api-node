@@ -16,6 +16,49 @@
 
 const express = require('express');
 const { randomUUID } = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// Minimal .env loader (no dotenv dependency): fills missing process.env
+// entries from `<server.js dir>/.env` so plain `node server.js` picks up
+// PORT / OPENCODE_URL / API_KEY without requiring `export` or --flags.
+// Precedence stays: CLI flags > shell env > .env file > defaults.
+function loadDotEnv(dotEnvPath) {
+  const target = dotEnvPath || path.join(__dirname, '.env');
+  let raw;
+  try {
+    raw = fs.readFileSync(target, 'utf8');
+  } catch {
+    return {}; // no .env file — nothing to do
+  }
+  const loaded = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const body = trimmed.startsWith('export ')
+      ? trimmed.slice('export '.length).trim()
+      : trimmed;
+    const eq = body.indexOf('=');
+    if (eq === -1) continue;
+    const key = body.slice(0, eq).trim();
+    if (!key) continue;
+    let value = body.slice(eq + 1).trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      loaded[key] = value;
+    }
+  }
+  return loaded;
+}
+
+loadDotEnv();
 
 let OPENCODE_URL = process.env.OPENCODE_URL || 'http://127.0.0.1:4096';
 let API_KEY = process.env.API_KEY || '';
@@ -879,6 +922,7 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.loadDotEnv = loadDotEnv;
 module.exports.parseArgs = parseArgs;
 module.exports.runSessionQuery = runSessionQuery;
 module.exports.backendFetch = backendFetch;

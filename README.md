@@ -211,9 +211,10 @@ CLI flags override the env vars above: `--port <n>`, `--opencode_url <url>`
 `--session [<id>]` queries session data from the backend instead of starting
 the server.
 
-Copy `.env.example` to `.env` and adjust it to your setup. `docker compose`
-loads `.env` automatically; plain `node server.js` does not read it (no dotenv
-dependency) — export the variables in your shell or use the CLI flags instead.
+Copy `.env.example` to `.env` and adjust it to your setup. `node server.js`
+reads `.env` automatically (built-in loader, no dotenv dependency);
+`docker compose` loads `.env` automatically too. Precedence: CLI flags >
+shell env > `.env` file > defaults.
 
 ## Tests
 
